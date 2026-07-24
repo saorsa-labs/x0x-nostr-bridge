@@ -273,3 +273,24 @@ async fn p_gated_excluded_from_search_end_to_end() {
         "end-to-end: the normal kind-9 with the term is returned"
     );
 }
+
+/// The startup topic pre-subscribe list (`known_channels`) is empty on a fresh
+/// store and lists a channel once an event for it is stored — so after a restart
+/// the bridge re-subscribes the channels it already has (WP1 PR #8 wiring).
+#[tokio::test]
+async fn known_channels_lists_channel_after_ingest() {
+    let history = Arc::new(HistoryStore::open_in_memory("test-community").unwrap());
+    let store = HistoryStoreEventStore::new(Arc::clone(&history), vec![]);
+    assert!(
+        store.known_channels().await.unwrap().is_empty(),
+        "fresh store has no channels"
+    );
+    let author = Keys::generate();
+    let msg = kind9(&author, "general", "hi", vec![]);
+    store.insert(&msg).await.unwrap();
+    let chans = store.known_channels().await.unwrap();
+    assert!(
+        chans.iter().any(|c| c == "general"),
+        "known_channels lists the channel after an event is stored"
+    );
+}
