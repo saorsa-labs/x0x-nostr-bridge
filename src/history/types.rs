@@ -13,6 +13,33 @@ pub enum Door {
     Mesh,
 }
 
+/// A backend-agnostic NIP-01 filter for the general read surface (`query` /
+/// `count`). Deliberately NOT `nostr::Filter`: the HTTP/WS lane owns the
+/// two-pass raw-JSON filter parse (extension fields, unknown-field handling) and
+/// maps its typed filters onto this precise struct.
+///
+/// **Semantics:** every field is a conjunction (AND) across fields; within a
+/// list field, membership is a disjunction (OR). An **empty `Vec` means the
+/// field is UNCONSTRAINED** (not "match nothing") — the caller must map a
+/// nostr empty-`Some`-set (which matches nothing) to an early return, never to
+/// an empty vec here. Ids/authors/`p` are lowercase hex; `h` is lowercased on
+/// match (channel ids are stored lowercase). Deleted rows and parked/quarantined
+/// events are never returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterSpec {
+    pub ids: Vec<String>,
+    pub kinds: Vec<u32>,
+    pub authors: Vec<String>,
+    /// `#h` channel scope.
+    pub h: Vec<String>,
+    /// `#e` event references.
+    pub e: Vec<String>,
+    /// `#p` pubkey references.
+    pub p: Vec<String>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+}
+
 /// A request to (re)emit a relay-signed kind-39005 thread summary for a root,
 /// post-commit. The caller resolves the current [`ThreadSummary`] and signs the
 /// overlay. Empty for events that produced no thread mutation.
@@ -31,6 +58,19 @@ pub struct IngestEffects {
     /// Roots whose 39005 summary should be re-emitted post-commit (dedup by
     /// root is the caller's job — 39005 is replaceable on `d=root`).
     pub emits: Vec<ThreadEmit>,
+}
+
+/// Outcome of persisting a relay-authored event (seed 39000, kind-13534
+/// membership list, group state 39000-39003) via
+/// [`crate::history::HistoryStore::store_relay_authored`]. Replaceable and
+/// parameterized-replaceable kinds keep only the latest per `(pubkey, kind,
+/// d-tag)` (NIP-01 tie-break: equal `created_at` keeps the lowest event id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayStoreOutcome {
+    Inserted,
+    Duplicate,
+    Replaced,
+    StaleRejected,
 }
 
 /// Outcome of the strict local door.
