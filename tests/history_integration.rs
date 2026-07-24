@@ -10,9 +10,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag};
+use nostr::{Event, EventBuilder, Filter, JsonUtil, Keys, Kind, Tag};
 use serde_json::{json, Value};
 
+use x0x_nostr_bridge::engine_api::HistoryEngine;
 use x0x_nostr_bridge::history::HistoryStore;
 use x0x_nostr_bridge::history_adapter::{HistoryStoreEngine, HistoryStoreEventStore};
 use x0x_nostr_bridge::relay::{router, AppState};
@@ -38,15 +39,26 @@ impl GossipTransport for FakeTransport {
 }
 
 async fn spawn_real() -> (SocketAddr, Arc<AppState>) {
+    let settings = Settings::default();
+    let p_gated: Vec<u32> = settings
+        .access
+        .p_gated_kinds
+        .iter()
+        .map(|&k| u32::from(k))
+        .collect();
     let history = Arc::new(HistoryStore::open_in_memory("test-community").unwrap());
-    let engine = Arc::new(HistoryStoreEngine::new(Arc::clone(&history)));
-    let store: Arc<dyn EventStore> = Arc::new(HistoryStoreEventStore::new(Arc::clone(&history)));
+    let engine = Arc::new(HistoryStoreEngine::new(
+        Arc::clone(&history),
+        p_gated.clone(),
+    ));
+    let store: Arc<dyn EventStore> =
+        Arc::new(HistoryStoreEventStore::new(Arc::clone(&history), p_gated));
     let state = Arc::new(AppState::new(
         store,
         Arc::new(FakeTransport),
         engine,
         Arc::new(RelayIdentity::ephemeral()),
-        Arc::new(Settings::default()),
+        Arc::new(settings),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -192,4 +204,72 @@ async fn reply_produces_39005_summary_in_window() {
     let content: Value =
         serde_json::from_str(summary.unwrap()["content"].as_str().unwrap()).unwrap();
     assert_eq!(content["reply_count"], 1);
+}
+
+// ---- WP2b: p-gated kinds must be unsearchable (store layer + end-to-end) ----
+
+/// A gift wrap (kind 1059, p-gated) with searchable content must NOT come back
+/// from NIP-50 search at the STORE layer — WP1b's `search(exclude_kinds)`, wired
+/// from the p-gated set, enforces this (Buzz nulls their search vector). A
+/// normal kind-9 with the same word stays searchable.
+#[tokio::test]
+async fn p_gated_excluded_from_search_at_store_layer() {
+    let history = Arc::new(HistoryStore::open_in_memory("test-community").unwrap());
+    let engine = HistoryStoreEngine::new(Arc::clone(&history), vec![1059]);
+    let author = Keys::generate();
+
+    let gift_wrap = EventBuilder::new(Kind::from(1059u16), "zzsecretwordzz hidden")
+        .sign_with_keys(&author)
+        .unwrap();
+    engine.ingest_local(&gift_wrap).await.unwrap();
+    let visible = kind9(&author, "general", "zzsecretwordzz visible", vec![]);
+    engine.ingest_local(&visible).await.unwrap();
+
+    let results = engine
+        .query(&Filter::new().search("zzsecretwordzz"))
+        .await
+        .unwrap();
+    assert!(
+        results.iter().all(|e| e.id != gift_wrap.id),
+        "store layer: p-gated kind 1059 must be excluded from search"
+    );
+    assert!(
+        results.iter().any(|e| e.id == visible.id),
+        "store layer: a normal kind-9 with the term stays searchable"
+    );
+}
+
+/// End-to-end (both layers): a stored p-gated event with matching text must not
+/// appear in a NIP-50 `/query` search result.
+#[tokio::test]
+async fn p_gated_excluded_from_search_end_to_end() {
+    let (addr, _state) = spawn_real().await;
+    let author = Keys::generate();
+    let gift_wrap = EventBuilder::new(Kind::from(1059u16), "qqmagicwordqq secret")
+        .sign_with_keys(&author)
+        .unwrap();
+    assert_eq!(
+        post_event(addr, &gift_wrap, &author.public_key().to_hex())
+            .await
+            .status(),
+        200
+    );
+    let visible = kind9(&author, "general", "qqmagicwordqq shown", vec![]);
+    assert_eq!(
+        post_event(addr, &visible, &author.public_key().to_hex())
+            .await
+            .status(),
+        200
+    );
+
+    let arr = query(addr, TYLER, json!([{ "search": "qqmagicwordqq" }])).await;
+    let arr = arr.as_array().unwrap();
+    assert!(
+        arr.iter().all(|e| e["id"] != gift_wrap.id.to_hex()),
+        "end-to-end: p-gated 1059 must not appear in search results"
+    );
+    assert!(
+        arr.iter().any(|e| e["id"] == visible.id.to_hex()),
+        "end-to-end: the normal kind-9 with the term is returned"
+    );
 }

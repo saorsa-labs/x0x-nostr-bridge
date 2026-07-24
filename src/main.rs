@@ -77,8 +77,19 @@ async fn main() -> anyhow::Result<()> {
     let community_fingerprint = std::env::var("BRIDGE_COMMUNITY_FINGERPRINT")
         .unwrap_or_else(|_| settings.public_base_url.clone());
     let history = Arc::new(HistoryStore::open(&db_path, &community_fingerprint)?);
-    let engine: Arc<dyn HistoryEngine> = Arc::new(HistoryStoreEngine::new(Arc::clone(&history)));
-    let store: Arc<dyn EventStore> = Arc::new(HistoryStoreEventStore::new(Arc::clone(&history)));
+    // p-gated kinds are excluded from NIP-50 search at the store layer.
+    let p_gated: Vec<u32> = settings
+        .access
+        .p_gated_kinds
+        .iter()
+        .map(|&k| u32::from(k))
+        .collect();
+    let engine: Arc<dyn HistoryEngine> = Arc::new(HistoryStoreEngine::new(
+        Arc::clone(&history),
+        p_gated.clone(),
+    ));
+    let store: Arc<dyn EventStore> =
+        Arc::new(HistoryStoreEventStore::new(Arc::clone(&history), p_gated));
 
     // Subscribe the global topic plus every channel we've ever stored.
     transport.ensure_topic(proto::GLOBAL_TOPIC).await?;
