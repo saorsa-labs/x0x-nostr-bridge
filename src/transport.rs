@@ -38,6 +38,13 @@ pub trait GossipTransport: Send + Sync {
     async fn ensure_topic(&self, topic: &str) -> anyhow::Result<()>;
     async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()>;
     fn inbox(&self) -> mpsc::Receiver<GossipMessage>;
+    /// Tear down a topic's daemon forwarder and prune the local tracking maps
+    /// (issue #4: the per-topic mutex map must not grow unbounded). Called by
+    /// the relay when the last subscriber for a topic unsubscribes. Default is a
+    /// no-op so test fakes need no change.
+    async fn remove_topic(&self, _topic: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Locate the running daemon's REST address + bearer token.
@@ -293,6 +300,17 @@ impl GossipTransport for X0xTransport {
         if !status.is_success() {
             let _ = resp.text().await;
             anyhow::bail!("publish to '{topic}' failed: HTTP {status}");
+        }
+        Ok(())
+    }
+
+    async fn remove_topic(&self, topic: &str) -> anyhow::Result<()> {
+        // Prune the tracking maps so they cannot grow unbounded (issue #4),
+        // then best-effort DELETE the daemon forwarder.
+        let id = self.shared.topics.remove(topic).map(|(_, id)| id);
+        self.shared.inflight.remove(topic);
+        if let Some(id) = id {
+            self.shared.unsubscribe_once(&id).await?;
         }
         Ok(())
     }

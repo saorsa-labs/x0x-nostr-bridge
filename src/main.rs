@@ -22,10 +22,16 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use x0x_nostr_bridge::config;
+use x0x_nostr_bridge::engine_api::HistoryEngine;
+use x0x_nostr_bridge::history::HistoryStore;
+use x0x_nostr_bridge::history_adapter::{HistoryStoreEngine, HistoryStoreEventStore};
 use x0x_nostr_bridge::ingest;
 use x0x_nostr_bridge::proto;
 use x0x_nostr_bridge::relay::{self, AppState};
-use x0x_nostr_bridge::store::{EventStore, SqliteStore};
+use x0x_nostr_bridge::relay_identity::RelayIdentity;
+use x0x_nostr_bridge::seed;
+use x0x_nostr_bridge::settings::Settings;
+use x0x_nostr_bridge::store::EventStore;
 use x0x_nostr_bridge::transport::{GossipTransport, X0xTransport};
 
 #[tokio::main]
@@ -51,9 +57,28 @@ async fn main() -> anyhow::Result<()> {
     let db_path =
         PathBuf::from(std::env::var("BRIDGE_DB").unwrap_or_else(|_| "nostr-bridge.db".to_string()));
     let (api, token) = config::resolve_api()?;
-
-    let store: Arc<dyn EventStore> = Arc::new(SqliteStore::open(&db_path)?);
     let transport: Arc<dyn GossipTransport> = Arc::new(X0xTransport::connect(&api, &token).await?);
+
+    // Bridge settings + relay identity (D4).
+    let settings = Arc::new(Settings::from_env());
+    let relay_key_path = PathBuf::from(std::env::var("BRIDGE_RELAY_KEY").unwrap_or_else(|_| {
+        db_path
+            .with_file_name("relay.key")
+            .to_string_lossy()
+            .into_owned()
+    }));
+    let identity = Arc::new(RelayIdentity::load_or_create(&relay_key_path)?);
+
+    // ONE durable history store behind both lanes: the HTTP `HistoryEngine`
+    // (read model + two-door ingest) and the WS `EventStore` (REQ backfill +
+    // EVENT ingest) wrap the same `HistoryStore`, so every read/write path hits
+    // one store (integration step 3). The community fingerprint guards against
+    // accidental scope reuse (design §3).
+    let community_fingerprint = std::env::var("BRIDGE_COMMUNITY_FINGERPRINT")
+        .unwrap_or_else(|_| settings.public_base_url.clone());
+    let history = Arc::new(HistoryStore::open(&db_path, &community_fingerprint)?);
+    let engine: Arc<dyn HistoryEngine> = Arc::new(HistoryStoreEngine::new(Arc::clone(&history)));
+    let store: Arc<dyn EventStore> = Arc::new(HistoryStoreEventStore::new(Arc::clone(&history)));
 
     // Subscribe the global topic plus every channel we've ever stored.
     transport.ensure_topic(proto::GLOBAL_TOPIC).await?;
@@ -61,11 +86,18 @@ async fn main() -> anyhow::Result<()> {
         transport.ensure_topic(&proto::channel_topic(&ch)).await?;
     }
 
-    let state = Arc::new(AppState {
-        store: Arc::clone(&store),
-        transport: Arc::clone(&transport),
-        hub: relay::Hub::new(),
-    });
+    let state = Arc::new(AppState::new(
+        Arc::clone(&store),
+        Arc::clone(&transport),
+        engine,
+        identity,
+        Arc::clone(&settings),
+    ));
+
+    if settings.seed_demo {
+        seed::seed_demo(&state).await?;
+        info!("demo seed applied (--seed-demo / BRIDGE_SEED_DEMO)");
+    }
 
     // Ingest: gossip → verify → store → fan out.
     let mut inbox = transport.inbox();
@@ -79,6 +111,43 @@ async fn main() -> anyhow::Result<()> {
     let app = relay::router(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, db = %db_path.display(), "x0x-nostr-bridge listening");
-    axum::serve(listener, app).await?;
+
+    // Graceful shutdown (WP3 stretch): on SIGTERM, refuse new `/` hits with 503,
+    // broadcast a 1012 Service-Restart close to every live WS, drain briefly.
+    let shutdown_state = Arc::clone(&state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            wait_for_terminate().await;
+            shutdown_state
+                .shutting_down
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            shutdown_state.shutdown.notify_waiters();
+            info!("SIGTERM: draining WS connections with 1012 (relay restarting)");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        })
+        .await?;
     Ok(())
+}
+
+/// Resolve when SIGTERM (or Ctrl-C) is received.
+async fn wait_for_terminate() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

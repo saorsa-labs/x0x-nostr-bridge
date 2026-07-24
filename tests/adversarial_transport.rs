@@ -34,7 +34,7 @@ use tokio::time::timeout;
 use x0x_nostr_bridge::config;
 use x0x_nostr_bridge::ingest;
 use x0x_nostr_bridge::proto;
-use x0x_nostr_bridge::relay::{AppState, Hub};
+use x0x_nostr_bridge::relay::AppState;
 use x0x_nostr_bridge::store::{EventStore, SqliteStore};
 use x0x_nostr_bridge::transport::{GossipMessage, GossipTransport, X0xTransport};
 
@@ -64,11 +64,7 @@ fn fresh_state() -> (AppState, TempDir) {
     let dir = tempfile::Builder::new().tempdir().unwrap();
     let store: Arc<dyn EventStore> =
         Arc::new(SqliteStore::open(&dir.path().join("adv.db")).unwrap());
-    let state = AppState {
-        store,
-        transport: Arc::new(NoopTransport) as Arc<dyn GossipTransport>,
-        hub: Hub::new(),
-    };
+    let state = AppState::with_defaults(store, Arc::new(NoopTransport) as Arc<dyn GossipTransport>);
     (state, dir)
 }
 
@@ -97,10 +93,12 @@ async fn serve(app: Router) -> std::net::SocketAddr {
     addr
 }
 
-/// How many stored events were signed by `keys` (author filter always matches).
+/// Stored events signed by `keys`. Gossip ingest goes through the mesh door of
+/// the history engine now (integration step 3), so observe the engine, not the
+/// spike EventStore.
 async fn stored_by(state: &AppState, keys: &Keys) -> Vec<Event> {
     state
-        .store
+        .engine
         .query(&nostr::Filter::new().author(keys.public_key()))
         .await
         .unwrap()
