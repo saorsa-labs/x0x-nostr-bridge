@@ -1,0 +1,241 @@
+{
+  "$comment": "Conformance vectors for Buzz thread_metadata, mined from block/buzz @ 710ed9ff (v0.4.24). Sources: crates/buzz-test-client/tests/e2e_nostr_interop.rs and crates/buzz-db/src/thread.rs #[cfg(test)]. IDs are symbolic placeholders (ROOT, R1, ...) — a driver substitutes real 32-byte event ids and channel uuids. Tag form is NIP-10 marked: [\"e\", <id>, <relay-hint>, <marker>]. 'kind' 9 = KIND_STREAM_MESSAGE. Every input event also carries an [\"h\", CHANNEL] tag (omitted from tags[] for brevity unless load-bearing) and is signed by the noted author. Expected outputs describe the thread_metadata row(s), counter deltas, ingest verdict, and any 39005 emit.",
+  "constants": {
+    "KIND_STREAM_MESSAGE": 9,
+    "KIND_THREAD_SUMMARY": 39005,
+    "KIND_WINDOW_BOUNDS": 39006,
+    "DEPTH_CAP": 100,
+    "PARTICIPANT_CAP": 10,
+    "partition_key": ["community_id", "event_created_at", "event_id"],
+    "top_level_predicate": "depth IS NULL OR depth = 0 OR (depth = 1 AND broadcast = true)",
+    "summary_content_shape": {"reply_count": "i32", "descendant_count": "i32", "last_reply_at": "unix_seconds|null", "participants": ["hex_pubkey"]},
+    "summary_tags": [["e", "<root_hex>"], ["d", "<root_hex>"], ["h", "<channel>"]]
+  },
+  "vectors": [
+    {
+      "id": "V1_simple_reply_to_root",
+      "source": "e2e_nostr_interop.rs::test_nip10_thread_reply_creates_metadata (L437-499)",
+      "covers": "reply-only marker (no root marker) => parent==root, depth 1",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root message", "tags": [], "note": "top-level; NO thread_metadata row created on insert"},
+        {"label": "R1", "author": "A", "kind": 9, "content": "reply to root", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "root_verdict": "accepted (top-level, depth=NULL, no metadata row)",
+        "R1_verdict": "accepted",
+        "R1_metadata": {"event_id": "R1", "parent_event_id": "ROOT", "root_event_id": "ROOT", "depth": 1, "broadcast": false},
+        "counters_after": {"ROOT_stub": {"reply_count": 1, "descendant_count": 1, "last_reply_at": "NOW()"}},
+        "get_thread_replies(ROOT)": ["R1"],
+        "root_not_in_thread_replies": true,
+        "emit_39005": {"e": "ROOT", "d": "ROOT", "reply_count": 1, "descendant_count": 1}
+      }
+    },
+    {
+      "id": "V2_reply_with_both_markers",
+      "source": "resolve_nip10_thread_meta L592-596, L630-651",
+      "covers": "root+reply markers, nested depth-2 via metadata branch",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "content": "child", "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "R2", "author": "C", "kind": 9, "content": "grandchild", "tags": [["e", "ROOT", "", "root"], ["e", "R1", "", "reply"]]}
+      ],
+      "expected": {
+        "R2_metadata": {"parent_event_id": "R1", "root_event_id": "ROOT", "depth": 2, "broadcast": false},
+        "counters_after": {"ROOT": {"reply_count": 1, "descendant_count": 2}, "R1_stub": {"reply_count": 1, "descendant_count": "n/a (not a root)"}},
+        "note": "descendant_count on ROOT counts BOTH R1 and R2; reply_count on ROOT counts only its DIRECT child R1; R1.reply_count counts its direct child R2.",
+        "emit_39005_for_ROOT": {"reply_count": 1, "descendant_count": 2, "participants_contains": ["B", "C"]}
+      }
+    },
+    {
+      "id": "V3_orphan_reply_unknown_parent_rejected",
+      "source": "e2e_nostr_interop.rs::test_nip10_unknown_parent_rejected (L502-529); ingest L608-610",
+      "covers": "parent-must-exist-at-ingest; out-of-order arrival",
+      "inputs": [
+        {"label": "R1", "author": "A", "kind": 9, "content": "orphan reply", "tags": [["e", "FAKE_PARENT_NEVER_STORED", "", "reply"]]}
+      ],
+      "expected": {
+        "R1_verdict": "REJECTED",
+        "ok_accepted": false,
+        "message_contains": "reply parent not found",
+        "stored_flat": false,
+        "gossip_note": "This is the rule an eventually-consistent backend CANNOT keep as-is: a reply may legitimately arrive before its parent. Bridge v2 must park+backfill, not reject."
+      }
+    },
+    {
+      "id": "V4_root_mismatch_rejected",
+      "source": "e2e_nostr_interop.rs::test_nip10_root_mismatch_rejected (L540-580); ingest L677-679",
+      "covers": "server-verified ancestry; client root must equal derived root",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "real root", "tags": []},
+        {"label": "R1_bad", "author": "A", "kind": 9, "content": "reply with wrong root", "tags": [["e", "WRONG_ROOT_0xab..", "", "root"], ["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "R1_bad_verdict": "REJECTED",
+        "ok_accepted": false,
+        "message_contains": "root tag does not match",
+        "reason": "parent ROOT has no metadata row => derived root defaults to ROOT itself; client claimed WRONG_ROOT => mismatch"
+      }
+    },
+    {
+      "id": "V5_only_root_marker_is_top_level",
+      "source": "resolve_nip10_thread_meta L592-596 (Some(_),None) arm",
+      "covers": "SUBTLE: only a root marker, no reply marker => NOT a reply",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "tags only root marker", "tags": [["e", "ROOT", "", "root"]]}
+      ],
+      "expected": {
+        "E1_verdict": "accepted",
+        "E1_metadata": null,
+        "E1_is_top_level": true,
+        "E1_depth": "NULL",
+        "counters_touched": "none (ROOT.reply_count stays 0)",
+        "note": "A naive reimplementation would treat root-only as a reply-to-root. Buzz does NOT."
+      }
+    },
+    {
+      "id": "V6_positional_etag_ignored",
+      "source": "resolve_nip10_thread_meta L573-589 (requires parts.len()>=4 marker)",
+      "covers": "positional/unmarked NIP-10 e-tag is ignored, stored flat (not rejected)",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "positional reply", "tags": [["e", "ROOT"]]}
+      ],
+      "expected": {
+        "E1_verdict": "accepted",
+        "E1_metadata": null,
+        "E1_is_top_level": true,
+        "note": "Buzz does not implement NIP-10 positional convention. Bare/unmarked e-tags never create thread ancestry and are never rejected — they become ordinary top-level messages."
+      }
+    },
+    {
+      "id": "V7_mention_marker_ignored",
+      "source": "resolve_nip10_thread_meta L579-583 (only root|reply matched)",
+      "covers": "marker 'mention' ignored",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "mentions root", "tags": [["e", "ROOT", "", "mention"]]}
+      ],
+      "expected": {"E1_verdict": "accepted", "E1_metadata": null, "E1_is_top_level": true}
+    },
+    {
+      "id": "V8_broadcast_depth1_surfaced_vs_hidden",
+      "source": "e2e_nostr_interop.rs::test_nip10_thread_reply_not_in_top_level (L862-961); thread.rs top-level predicate L597-600",
+      "covers": "broadcast flag gates a depth-1 reply into the channel window",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root-toplevel", "tags": []},
+        {"label": "R_hidden", "author": "A", "kind": 9, "content": "reply-excluded", "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "R_shown", "author": "A", "kind": 9, "content": "reply-broadcast", "tags": [["e", "ROOT", "", "reply"], ["broadcast", "1"]]}
+      ],
+      "expected": {
+        "both_recorded_under_root": ["R_hidden", "R_shown"],
+        "R_hidden_metadata": {"depth": 1, "broadcast": false},
+        "R_shown_metadata": {"depth": 1, "broadcast": true},
+        "channel_window_rows_contains": ["ROOT", "R_shown"],
+        "channel_window_rows_excludes": ["R_hidden"],
+        "rule": "depth=1 reply is a top-level row IFF broadcast=true"
+      }
+    },
+    {
+      "id": "V9_channel_window_summary_overlay",
+      "source": "e2e_nostr_interop.rs::test_channel_window_rows_overlays_and_exact_multiple_exhaustion (L1770-1852); bridge.rs L534-556",
+      "covers": "include_summaries emits relay-signed 39005 for rows with replies; reply is never a row",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "windowed root", "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "content": "window reply", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "query": {"endpoint": "POST /query (channel window)", "extensions": {"include_summaries": true}},
+      "expected": {
+        "rows_contains": ["ROOT"],
+        "rows_excludes": ["R1"],
+        "overlay_39005": {"kind": 39005, "signed_by": "relay_keypair (NOT requester)", "tags_contain": [["e", "ROOT"], ["d", "ROOT"], ["h", "CHANNEL"]], "content.reply_count": 1},
+        "overlay_39006_window_bounds": {"kind": 39006, "count_per_response": 1},
+        "rows_without_replies_get_no_39005": true
+      }
+    },
+    {
+      "id": "V10_client_overlay_kinds_rejected",
+      "source": "e2e_nostr_interop.rs::test_channel_window_rejects_half_cursor_and_client_overlay_kinds (L1918-1980)",
+      "covers": "39005/39006 are relay-authored only; client submissions rejected at ingest",
+      "inputs": [
+        {"label": "spoof_summary", "author": "A", "kind": 39005, "content": "{\"reply_count\":999}", "tags": [["e", "ROOT", "", ""], ["d", "ROOT"], ["h", "CHANNEL"]]},
+        {"label": "spoof_bounds", "author": "A", "kind": 39006, "content": "{}", "tags": [["h", "CHANNEL"]]}
+      ],
+      "expected": {"spoof_summary_verdict": "REJECTED", "spoof_bounds_verdict": "REJECTED"}
+    },
+    {
+      "id": "V11_deep_nesting_at_cap",
+      "source": "resolve_nip10_thread_meta L646-649 (depth>100 => Err)",
+      "covers": "depth cap 100: level 100 accepted, level 101 rejected",
+      "inputs": [
+        {"label": "chain", "note": "root R0 (depth NULL) then R1..R100 each replying to the previous with markers [\"e\",ROOT,\"\",\"root\"],[\"e\",R{n-1},\"\",\"reply\"]. R_k has depth k."},
+        {"label": "R100", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "R99", "", "reply"]]},
+        {"label": "R101", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "R100", "", "reply"]]}
+      ],
+      "expected": {
+        "R100_verdict": "accepted", "R100_depth": 100,
+        "R101_verdict": "REJECTED", "R101_message_contains": "thread depth limit exceeded",
+        "counters": "ROOT.descendant_count == 100 after full chain (each level bumps root once); ROOT.reply_count == 1 (only R1 is a direct child)"
+      }
+    },
+    {
+      "id": "V12_cross_channel_parent_rejected",
+      "source": "resolve_nip10_thread_meta L612-616",
+      "covers": "reply whose parent lives in a different channel is rejected",
+      "inputs": [
+        {"label": "root_chanA", "author": "A", "kind": 9, "content": "root in channel A", "channel": "CH_A", "tags": []},
+        {"label": "R1", "author": "A", "kind": 9, "content": "reply from channel B", "channel": "CH_B", "tags": [["e", "ROOT_CHAN_A", "", "reply"]]}
+      ],
+      "expected": {"R1_verdict": "REJECTED", "message_contains": "parent event belongs to a different channel"}
+    },
+    {
+      "id": "V13_nested_reply_before_root_stub",
+      "source": "thread.rs::insert_thread_metadata_nested_reply_creates_root_stub (L1276-1340) + get_thread_replies_reaches_nested_depth_two_replies (L1181-1275)",
+      "covers": "depth-2 grandchild where root!=parent creates the root stub row lazily; subtree read reaches it",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "child", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "grandchild", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "CHILD", "", "reply"]]}
+      ],
+      "expected": {
+        "grandchild_metadata": {"parent_event_id": "CHILD", "root_event_id": "ROOT", "depth": 2},
+        "get_thread_replies(ROOT, depth_limit=64)_contains": ["child", "grandchild"],
+        "subtree_read_must_not_stop_at_depth_1": true,
+        "note": "exercises the root_id != parent_id stub-INSERT branch (thread.rs L182-205)"
+      }
+    },
+    {
+      "id": "V14_same_second_tie_pagination",
+      "source": "thread.rs::get_thread_replies_pages_same_second_ties_without_loss (L1057-1166)",
+      "covers": "keyset cursor is (event_created_at, event_id) composite — same-second ties must not be dropped across pages",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "R1..R5", "author": "A", "kind": 9, "created_at": "ALL == root.created_at + 1 (identical second)", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "paginate_limit_2": "pages walk (created_at, id) tuples > cursor, not created_at alone",
+        "total_collected": 5,
+        "duplicates": 0,
+        "loss": 0,
+        "note": "a timestamp-only cursor would silently drop tied replies past the first page limit"
+      }
+    },
+    {
+      "id": "V15_delete_reply_decrements_counters",
+      "source": "thread.rs::decrement_reply_count (L292-322) + get_thread_metadata_by_event (L755-810)",
+      "covers": "soft-delete of a reply mirrors the increment: parent.reply_count-1 and root.descendant_count-1, floored at 0; late 39005 recompute",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "delete_R1", "author": "B", "kind": "5 (NIP-09) or 9005 (NIP-29 delete-event)", "tags": [["e", "R1"]]}
+      ],
+      "expected": {
+        "counters_after_reply": {"ROOT": {"reply_count": 1, "descendant_count": 1}},
+        "counters_after_delete": {"ROOT": {"reply_count": 0, "descendant_count": 0}},
+        "floor": "GREATEST(x-1, 0) — never negative even on duplicate delete",
+        "emit_39005_after_delete": {"reply_count": 0, "descendant_count": 0},
+        "note": "if the ROOT row was itself deleted, get_thread_summary returns None and emit_live_thread_summary silently no-ops (side_effects L739-741)"
+      }
+    }
+  ]
+}

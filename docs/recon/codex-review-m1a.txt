@@ -1,0 +1,1717 @@
+OpenAI Codex v0.144.1
+--------
+workdir: /private/tmp/claude-501/-Users-davidirvine-Desktop-Devel-projects-x0x/bd2e18ed-68f8-4883-bb4f-30b27b6c2ae1/scratchpad
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f95d2-30e6-7900-a598-a6da8c65ce38
+--------
+user
+# Design Review: Bridge v2 M1a — x0x-nostr-bridge on Buzz v0.4.24
+
+You are reviewing a Nostr relay bridge design that will serve Block's Buzz desktop client (relay mode) over an x0x gossip mesh. The design is at bridging stage M1a: HTTP + WS dialect, thread_metadata computation, SQLite storage, 4-spec gate. Deliver a verdict: SOUND / SOUND-WITH-CHANGES / UNSOUND, plus numbered findings tagged BLOCKING or ADVISORY.
+
+## NORMATIVE DOCUMENTS (ground truth)
+
+### 1. DIALECT CONTRACT (dialect.md)
+- HTTP POST /events: single event ingest, returns {event_id, accepted, message}
+- HTTP POST /query: array of filters (+ Buzz extensions: top_level, include_summaries, include_aux, before_id, thread_cursor), returns raw event array
+- HTTP GET /info: NIP-11 doc, advertises NIP-43 (membership) only if enforced
+- WS: vanilla NIP-01 + NIP-42 (connection-first AUTH challenge, 5s timeout, kind-22242 signed event with relay-tag matching tenant URL; failure → terminal session)
+- Rate limit (429): body contains "retry in Ns" string (not Retry-After header)
+- Graceful shutdown (SIGTERM): send 1012 close to all WS connections, then 503 on new requests
+- Auth: X-Pubkey dev-auth (BUZZ_REQUIRE_AUTH_TOKEN=false) for config-mode tests; NIP-98 for production
+- Membership: enforce_relay_membership checks if caller in a cached member set; isolated per channel
+- Host header: multi-tenant by Host; localhost:3000 → single-community demo
+
+### 2. THREAD SEMANTICS (thread.md)
+Ingest algorithm (resolve_nip10_thread_meta):
+- MARKED e-tags ONLY: [["e", <id>, <relay>, <marker>]] where marker ∈ {root, reply}; positional/unmarked ignored
+- ONLY-ROOT IS TOP-LEVEL: (root marker present, reply marker absent) → treated as non-threaded top-level, depth=NULL, no metadata row
+- PARENT-MUST-EXIST-AT-INGEST: parent_id resolved from reply marker; if parent not found → reject "reply parent not found"
+- SERVER-VERIFIED-ANCESTRY: client-supplied root must match derived root (client cannot lie); if mismatch → reject
+- DEPTH CAP 100: if parent has metadata with depth=D and D≥100 → reject "thread depth limit exceeded"
+- THREAD_METADATA row: (community_id, event_created_at, event_id) as PK, parent_event_id, root_event_id, depth, reply_count, descendant_count, last_reply_at
+- COUNTERS: reply_count = direct children; descendant_count = all nested; updated transactionally with event insert
+- LAZY ROOT STUBS: if parent has no metadata row (is a root), INSERT stub row for parent+root, then UPDATE counters
+- LAST_REPLY_AT: wall-clock NOW() at ingest (local door), max(created_at) on mesh door (LWW register)
+- BROADCAST FLAG: if event carries ["broadcast","1"] tag, broadcast=true; depth-1 broadcast replies are top-level rows
+- TOP-LEVEL PREDICATE: depth IS NULL OR depth = 0 OR (depth = 1 AND broadcast = true)
+- REACTIONS (kind 7): handled on SEPARATE branch, never create thread metadata; use last-e-tag target (NIP-25)
+- CLIENT SUBMISSIONS 39005/39006: relay-authored only; client kind-39005 or kind-39006 submissions → rejected at ingest
+- LIVE 39005 EMIT: post-commit, fire-and-forget, recompute get_thread_summary(root_id), fan-out to redis EventTopic::Channel + local WS subscribers
+- 39005 PAYLOAD: {"reply_count", "descendant_count", "last_reply_at", "participants":[...]} (10 pubkey cap); tags ["e",root], ["d",root], ["h",channel]
+- DELETE DECREMENTS: soft-delete path mirrors increments via decrement_reply_count/get_thread_metadata_by_event; floor at 0
+
+Cross-bridge note: the design defers cross-bridge thread convergence to Stage 3 (ADR-0023 histor y store).
+
+### 3. CONFORMANCE GATE VECTORS (thread-fixtures.json, §constants + 15 vectors)
+Vectors V1–V15 cover: simple reply, both markers, orphan reject, root mismatch reject, only-root is top-level, positional e-tag ignored, mention marker ignored, broadcast depth-1 gating, window overlay emission, client 39005/39006 reject, depth-cap at 100, cross-channel parent reject, lazy root stub + nested read, same-second keyset pagination, delete-decrement. Every vector includes input events, expected verdict (accept/reject), metadata shape, and counter state.
+
+KEY SURPRISES (V5, V6, V7, V13, V14):
+- V5: only-root marker → top-level (NOT a reply)
+- V13: nested depth-2 creates root stub lazily
+- V14: same-second ties require (created_at, event_id) composite keyset, not timestamp-only
+
+### 4. RELAY-MODE SPECS (tests.md §7)
+M1a gate consists of 4 Playwright specs run via `pnpm test:e2e:integration`:
+1. integration.spec.ts — core round-trips: channel list, cross-user delivery, mention-feed refetch, DM channel+send, forum
+2. stream.spec.ts — live streaming: load from relay, send, real-time delivery, scroll-pinning
+3. dm-double-notification.spec.ts — incoming DM → exactly 1 notification; DM channel id = uuid5(DNS, "buzz.channel.dm.alice-tyler")
+4. parity-ancestor-island.spec.ts — thread history frontier: no ancestor-island gaps; keyset cursor must not drop same-second ties
+
+Seeding: pre-seeded community "general" with members tyler/alice/bob/charlie (hardcoded hex pubkeys in tests/helpers/bridge.ts); per-spec via seedScenario. DM channel alice-tyler pre-seeded with uuid5 id.
+
+Acceptance: all 4 specs GREEN, thread-vector suite GREEN, 4 spike-hardening issues closed (NIP-11 test, connection cap, NIP-42 relay-tag, mutex pruning).
+
+### 5. SPIKE REUSE AUDIT (spike.md)
+Existing code status:
+- Row 1 (WS dialect): COVERED — dispatch, EOSE, CLOSE + OK/NOTICE/CLOSED. AUTH PARTIAL — relay-tag NOT checked (spike gap).
+- Row 2 (NIP-42 AUTH): PARTIAL — challenge + verify, but relay-tag validation skipped
+- Row 3 (POST /events HTTP): MISSING — no HTTP route; ingest is WS-only
+- Row 4 (POST /query Buzz ext): MISSING — no HTTP /query; WS REQ only, no keyset cursor, no extensions, no scope column
+- Row 5 (NIP-50 search): PARTIAL — FTS5 engine works, WS-only (no HTTP /query routing)
+- Row 6 (thread_metadata): MISSING — 0 ancestry logic, no counters, no partition keys, fire-and-forget insert
+- Row 7 (GET /info membership): MISSING — no membership, no /info route
+- Row 8 (live 39005 emit): MISSING — no post-commit hook, no summary recompute, no fan-out
+
+Schema is flat (no scope/thread/community columns) with indexes on kind, pubkey, created_at only. No keyset cursor support. Ordered DESC by created_at + ASC id.
+
+## DESIGN UNDER REVIEW (bridge-v2-m1a.md)
+
+### Decision D1: One bridge = one community, serialized writer
+Defers cross-bridge convergence to Stage 3 (ADR-0023). Single-community scope makes thread counters transactional without CRDTs.
+
+### Decision D2: Two-door ingest
+- Local door (HTTP /events + WS EVENT): strict Buzz semantics — parent-must-exist, orphan replies REJECTED, root verified server-side, depth cap 100
+- Mesh door (gossip): park orphans in pending table, attach+recompute when parent lands, quarantine ancestry mismatches (don't hard-reject)
+
+### Decision D3: Bridge-local SQLite authoritative (not /history/*)
+Thread_metadata computed in-bridge for M1a; defers ADR-0023 history to Stage 3.
+
+### Decision D4: Relay keypair (secp256k1) signs NIP-11, 39005, 39006, 13534 membership list
+Loopback-dialect artifact; authenticates nothing in x0x terms.
+
+### Decision D5: Both HTTP auth paths (X-Pubkey dev + NIP-98 full)
+Default `require_auth_token=false` accepts X-Pubkey; `=true` requires full NIP-98 verification.
+
+### Decision D6: Frozen proto.rs gets v2 module
+Reuse WS core (dispatch, EOSE, FTS); new modules for HTTP dialect, window read-model, thread engine behind existing seams.
+
+### Schema (replaces spike's flat table)
+```sql
+events(id, pubkey, created_at, kind, tags JSON, content, sig, raw,
+       channel_id,           -- resolved #h
+       deleted INTEGER DEFAULT 0)
+  INDEX (channel_id, created_at DESC, id ASC)   -- window keyset
+
+thread_metadata(event_id, event_created_at,
+       channel_id, parent_event_id, root_event_id,
+       depth, reply_count DEFAULT 0, descendant_count DEFAULT 0,
+       last_reply_at, broadcast DEFAULT 0)
+  INDEX (root_event_id, event_created_at ASC, event_id ASC)  -- thread keyset
+
+pending_orphans(event_id, parent_event_id, raw JSON, received_at)
+
+members(channel_id, pubkey, role, PRIMARY KEY(channel_id,pubkey))
+
+nip98_seen(event_id, expires_at)  -- replay cache (D5)
+
+fts5(content)  -- unchanged from spike
+```
+
+Single-community → no community_id column; keyset tuples collapse to (created_at, id). Preserves Buzz's tie-safe cursor contract.
+
+### Work packages
+- **WP1 (storage + thread engine)**: schema above, ingest transaction per thread.md §1, orphan parking, fixture vectors gate
+- **WP2 (HTTP dialect)**: axum POST /events, /query (window model), /count; extensions per dialect.md §1; 1 MiB body cap; error envelope
+- **WP3 (WS + hardening)**: NIP-42 relay-tag validation, connection cap, NIP-11 test, per-topic pruning, 1012 drain on SIGTERM
+- **WP4 (seed + gate)**: --seed-demo, general channel + members, DM channel uuid5, Playwright tic-tac-toe integration, justfile bridge-gate recipe
+- **WP5 (mesh binding)**: verify mesh-door routing, dedup by event-id, live fan-out post-commit
+
+Ordering: WP1 ∥ WP2-skeleton → WP2 full → WP3 ∥ WP4 → gate. WP1 critical path.
+
+## REVIEW QUESTIONS
+
+1. **SOUNDNESS**: Does the design satisfy the recon-established contracts?
+   - (a) Single-community schema collapse: does dropping community_id lose anything the 4 gate specs or client's cursor contract need? Keyset tuples stay (created_at, id), partition key drops community scope — is that safe for thread_metadata queries in a single-instance bridge? Describe any edge case where cursor ordering or bounds could diverge.
+   - (b) Two-door ingest: is there any window where mesh-door parking/quarantine could poison local-door invariants or serve a state that violates the client's 39006-only pagination assumption (client never double-fetches a page, never skips a row)?
+   - (c) D1's deferred cross-bridge convergence: walk the 4 gate specs' assertions against D1's design — is any spec or client behavior silently dependent on cross-bridge convergence that M1a does NOT build?
+
+2. **COMPLETENESS vs the gate**: walk the 4 specs' test assertions (tests.md §7 table) against WPs.
+   - integration.spec: "cross-user delivery via WS live REQ", "home-feed/mention refetch" — does WP1 thread-metadata path support mention filtering + refetch? Does WP2 deliver `#p`-gated queries?
+   - stream.spec: "real-time delivery to 2nd context", "scroll-pinning under live fan-out" — does WP2 window model + WP5 mesh-binding prevent a race where a late-arriving reply changes a cached window's size mid-scroll?
+   - dm-double-notification: "DM channel id = uuid5(DNS, 'buzz.channel.dm.alice-tyler')" — is the DM channel pre-seeded in WP4 or dynamically created at first DM arrival? What if two users attempt the first DM simultaneously?
+   - parity-ancestor-island: "gap-free paging, seen.size > GAP_COUNT*0.9" — does thread.rs's composite (created_at, event_id) keyset implementation match the query's WHERE clause in WP2? Are same-second ties handled identically in both window and thread paths?
+
+3. **ORDERING/RISK**: Is WP1-first right? Is anything critical-path missing?
+   - Window read-model fidelity depends on WP1 schema; does it also depend on auxiliary data (e.g., aux-closure reaction deltas, participant queries' pubkey distribution) that the schema doesn't index?
+   - Orphan parking (D2, WP1) requires identifying when a parent lands; is the backfill trigger driven by mesh-door arrival only, or does it also need to catch local-door parents retroactively?
+   - Live 39005 fan-out (WP3) publishes only post-commit; if a reply arrives and publishes a 39005 before the client has polled the updated window, is there a race where cursor bounds are stale?
+
+4. **OVERBUILT for M1a?** Anything that should defer to M1b/Stage 3?
+   - D5 (full NIP-98 verification) — does the M1a gate (config-mode, X-Pubkey auth) actually exercise it, or is it build-debt for production-auth that belongs in M1b?
+   - Presence synthesis (explicitly out): is the bridge's "return empty" implementation sufficient, or do the specs have a hidden dependency on /query presence filters?
+   - 1012 graceful drain (WP3 stretch): does relay-restart.live.spec (skip-by-default, NOT M1a) block M1a, or can the bridge defer 1012 to M1b and still pass all 4 specs?
+
+## VERDICT
+
+SOUND / SOUND-WITH-CHANGES / UNSOUND
+
+## FINDINGS
+
+[Numbered list; each tagged BLOCKING or ADVISORY; phrased as "X violates Y because Z".]
+
+
+Additional file access: the full normative recon docs are in ./m1a-recon/ (dialect.md, thread.md, thread-fixtures.json, tests.md, spike.md) and the design under review is ./m1a-recon/bridge-v2-m1a.md — read them rather than relying only on the summary above. End your response with the verdict line exactly once, formatted: VERDICT: <SOUND|SOUND-WITH-CHANGES|UNSOUND>
+
+codex
+I’ll inspect all six recon/design files first, then trace each gate assertion and thread vector requirement to the proposed schema and work packages. I’ll keep the final verdict evidence-focused and end with the exact required verdict line.
+exec
+/bin/zsh -lc "wc -l m1a-recon/dialect.md m1a-recon/thread.md m1a-recon/thread-fixtures.json m1a-recon/tests.md m1a-recon/spike.md m1a-recon/bridge-v2-m1a.md && sed -n '1,240p' m1a-recon/dialect.md && sed -n '1,300p' m1a-recon/thread.md" in /private/tmp/claude-501/-Users-davidirvine-Desktop-Devel-projects-x0x/bd2e18ed-68f8-4883-bb4f-30b27b6c2ae1/scratchpad
+ succeeded in 0ms:
+     313 m1a-recon/dialect.md
+     125 m1a-recon/thread.md
+     241 m1a-recon/thread-fixtures.json
+     402 m1a-recon/tests.md
+     129 m1a-recon/spike.md
+     161 m1a-recon/bridge-v2-m1a.md
+    1371 total
+# Buzz relay HTTP/WS dialect — wire contract for x0x-nostr-bridge (M1a)
+
+Anchor: `block/buzz` @ `710ed9fff57878a1d69f809b80a6ee0416c53fc4` (Buzz Desktop v0.4.24).
+Clone root in this recon: `scratchpad/buzz-dialect/`. All `file:line` below are relative to that root.
+
+Server route table: `crates/buzz-relay/src/router.rs:61-125`. The public Nostr surface is:
+`GET /` (NIP-11 doc OR WS upgrade, content-negotiated), `GET /info` (NIP-11 doc),
+`POST /events`, `POST /query`, `POST /count`, plus health probes. Everything is
+**per-tenant, bound by the HTTP `Host` header** via `crate::tenant::bind_community(db, host)`
+(`bridge.rs:625`, and identically at the WS door). An unmapped Host → generic `404 "relay: no
+community is configured for this host"`. A bridge that serves one community can ignore multi-tenancy,
+but MUST still accept whatever Host the client sends (the desktop derives it from the relay URL).
+
+Global request body cap: **1 MiB** (`RequestBodyLimitLayer`, `router.rs:~118`). Over that → 413.
+
+---
+
+## 0. Auth model (applies to /events, /query, /count)
+
+All three HTTP bridge endpoints require **NIP-98** auth (`bridge.rs:1-11`, `verify_bridge_auth*`
+`bridge.rs:70-160`):
+
+- Header: `Authorization: Nostr <base64(kind-27235 event JSON)>`. The kind:27235 event's `u` tag
+  MUST equal the tenant-expected URL (`nip98_expected_url(relay_url, tenant, "/events"|"/query")`,
+  `bridge.rs:178`), `method` tag MUST match, and for writes the `payload` tag (sha256 of body)
+  is checked when `require_payload`.
+- **Replay protection**: event id is recorded in a shared community-scoped seen-set with TTL
+  (`check_nip98_replay`, `bridge.rs:~120`). A replayed id → `401 "NIP-98: replay detected"`;
+  guard unavailable → `401 "NIP-98: replay check unavailable"` (fail-closed).
+- **Dev fallback**: `X-Pubkey: <hex>` is accepted **only** when `require_auth_token=false`
+  (`bridge.rs:~150`). Zero event-id, no replay check. Do not rely on this for prod.
+- Missing/!valid auth → `401 "missing Nostr auth"`.
+- **Rate limit** runs before replay/parse: `enforce_http_admission` (`bridge.rs:30-66`), see §5.
+- **Membership gate** runs after auth: `enforce_relay_membership(state, community, pubkey_bytes,
+  x-auth-tag)` (`bridge.rs:~995`, `bridge.rs:~900` for query). Optional `X-Auth-Tag` header carries a
+  NIP-OA delegation tag (owner-delegation fallback on closed relays).
+
+Error envelope for every 4xx/5xx on these routes is `api_error(status, msg)` →
+`{"error": "<msg>"}` as JSON with that status (helper in `crates/buzz-relay/src/api/mod.rs`,
+used everywhere as `api_error`/`internal_error`/`not_found`).
+
+---
+
+## 1. POST /query — channel-timeline read path (THE critical one)
+
+Handler: `bridge.rs:880 query_events` → `bridge.rs:~940 query_events_authed`.
+
+### Request
+Body is a **JSON array of Nostr filters** (standard REQ filter objects), same as a WS `REQ`'s
+filter list. Two-pass parse (`bridge.rs:~1000`): raw JSON is kept because `nostr::Filter` silently
+drops unknown fields, and Buzz's extension fields live outside the standard schema. Extensions are
+read off the **raw** filter Value, not the typed Filter:
+
+| Field | Type | Meaning | Extractor |
+|-------|------|---------|-----------|
+| `top_level` | bool | Opt into the channel-window read-model (see below) | `extension_flag` `bridge.rs:283` |
+| `include_summaries` | bool | Append 39005 thread-summary overlays | `extension_flag` |
+| `include_aux` | bool | Append reaction/deletion/edit closure | `extension_flag` |
+| `before_id` | 64-hex | Keyset cursor tiebreak (event id); pairs with `until` | `extract_before_id` `bridge.rs:~305` |
+| `until` | unix secs | Keyset cursor timestamp; pairs with `before_id` | standard Filter field |
+| `page` | u64 (>1) | Offset paging for non-window directory (kind:0) queries | `extract_page_offset` `bridge.rs:~250` |
+| `thread_cursor`/`threadCursor` (+`thread_cursor_id`/`threadCursorId`) | i64 secs + hex | Thread-reply keyset cursor | `extract_thread_cursor` `bridge.rs:304` |
+| `depth_limit`, `feed_types` | u32 / list | Thread/feed shaping (thread agent's area) | `extract_depth_limit` etc. |
+
+Client build site (initial channel-window load) — `commands/channel_window.rs:19-35`:
+```
+{ "#h": [channelId], "kinds": TIMELINE_KINDS, "limit": cap,      // cap = min(rows,200), default 50
+  "top_level": true, "include_summaries": true, "include_aux": true }   // + "until"/"before_id" only when paginating
+```
+- **(a) Initial load**: no `until`/`before_id` (head request). `limit` = `min(requested,200)`, default 50.
+- **(b) Pagination**: adds `"until": cursor.created_at` AND `"before_id": cursor.event_id`
+  (`channel_window.rs:32-33`). Both-or-neither is enforced; a lone `until` or lone `before_id` is a
+  `400`, NOT a demote to head. Client derives the cursor from the 39006 bounds overlay it received
+  (see response).
+- **(c) NIP-50 search**: any filter with a `search` field routes to `handle_bridge_search`
+  (`bridge.rs:~1020`). Mixing search and non-search filters in one request → `400 "mixed search and
+  non-search filters not supported"`.
+
+### Channel-window semantics (`top_level: true`) — `handle_channel_window_filter` bridge.rs:~410-585
+- Requires exactly one `#h` channel or → `400 "top_level requires exactly one #h channel"`.
+- Inaccessible channel → **empty result, 200** (access-scope skip, not an error).
+- `before_id` present-but-malformed → `400 "top_level: before_id must be a 64-hex event id"`.
+- Half cursor → `400 "top_level cursor requires both until and before_id, or neither"`.
+- Row budget: default 50, max 200 (`BRIDGE_WINDOW_DEFAULT/MAX_LIMIT`). Overlays + aux do NOT
+  consume the budget.
+
+### Response — **bare JSON array of Nostr events** (`Json(Value::Array(...))`, `bridge.rs:~1025`)
+There is **NO envelope object**. The array is heterogeneous and the client demultiplexes by `kind`.
+For a `top_level` request the relay appends, in this order (`bridge.rs:~470-585`):
+1. **Row events**: the actual channel messages, in keyset order (server's `created_at DESC, id ASC`).
+2. **Aux closure** (if `include_aux`): reactions (7), deletions (5 / NIP-29 delete), edits, plus
+   deletions-of-aux (second hop). Real stored events.
+3. **Thread-summary overlays** (if `include_summaries`): one **relay-signed synthetic kind 39005**
+   per row that has replies. `content` = `{reply_count, descendant_count, last_reply_at,
+   participants:[hex...]}`; tags `["e",root],["d",root],["h",channel]`.
+4. **Window-bounds overlay**: **exactly one relay-signed synthetic kind 39006** — the sole authority
+   on exhaustion. `content` = `{"has_more": bool, "next_cursor": {"created_at": secs, "id": hex} | null}`;
+   `d` tag = `"{channel}:{ts}:{id}"` or `"{channel}:head"`. The client reads `next_cursor` from this
+   event to build the next page's `until`+`before_id`. **`rows < limit` proves nothing** — the final
+   exact-multiple page still needs the 39006 to say `has_more:false`.
+
+Non-window paths (feed/thread/catchall) and search return the same bare-array shape but without the
+39005/39006 overlays. Presence filters (kinds = only `KIND_PRESENCE_UPDATE`/`_SNAPSHOT`) are
+**synthesized from Redis**, returned as relay-built ephemeral events, never DB-queried
+(`synthesize_presence` `bridge.rs:1920`).
+
+### Read-path authorization (mirror of WS REQ; `bridge.rs:~975-990`)
+- P-gated kinds (gift wraps, member notifications, observer frames): filter MUST carry `#p` = caller
+  pubkey → else `403 "restricted: p-gated kinds require #p tag matching your pubkey"`.
+- Agent-engram kinds: require `authors=[self]` or `#p=[self]` → else `403`.
+- Author-only kinds: require `authors=[self]` → else `403`.
+- Results are always filtered to channels the caller can access
+  (`get_accessible_channel_ids_cached`).
+
+---
+
+## 2. POST /events — HTTP event ingest
+
+Handler: `bridge.rs:613 submit_event` → `bridge.rs:~750 submit_event_authed`.
+
+### Request
+Body = **a single Nostr event JSON object** (not an array). Order of checks: admission (429) →
+replay (401) → body parse → membership → ingest.
+
+### Response
+- **Accepted / duplicate / soft-reject-with-message**: `200` with
+  `{"event_id": "<hex>", "accepted": <bool>, "message": "<string>"}` (`bridge.rs:~810`). Note a
+  stored duplicate is still `accepted:true`-ish via the ingest result; the `accepted` bool is the
+  ingest verdict, `message` is human text. **The client does not get a NIP-20 `OK` tuple over HTTP —
+  it gets this object.**
+- **Parse failure**: `400 {"error":"invalid event JSON: <serde msg>"}` (`bridge.rs:~770`).
+- **Ingest rejected** (`IngestError::Rejected`): `400 {"error":"<full reason>"}` (`bridge.rs:~830`).
+- **Auth failed at ingest** (`IngestError::AuthFailed`): `403 {"error":<msg>}`.
+- **Internal**: `500 {"error":<msg>}`.
+- Admission/replay/membership failures surface as their §0/§5 codes (429/401/403).
+
+Desktop call sites: HTTP submit path in `desktop/src-tauri/src/relay.rs` and `relay/submit.rs`
+(publish, command events, membership writes, snapshot/archive import). WS publish uses `["EVENT",...]`
++ `OK` instead; the HTTP path is used where a synchronous ack is wanted.
+
+---
+
+## 3. GET /info — NIP-11 doc & membership gate
+
+Handler: `nip11.rs:172 relay_info_handler` → `nip11.rs:~300 nip11_document`. **Unauthenticated**,
+served to unmapped hosts too. Returns a NIP-11 `RelayInfo` JSON. Key fields the client keys off:
+- `supported_nips`: array of ints. **NIP-43 (relay membership) is advertised ONLY when membership
+  is actually enforced AND the relay has a stable signing key** (`nip11_facts` `nip11.rs:~296`,
+  `advertise_nip43 = has_stable_key && require_relay_membership`).
+- `self` (`relay_self`): relay's stable signing pubkey hex, present whenever a stable key exists.
+  Consumed by NIP-29/NIP-43 verification. Absent on ephemeral-key relays.
+- `software`, `version`, `icon`, `limitation{...}`, `supported_extensions:["nip-er"]`, optional `push`.
+
+Client decision (`commands/relay_members.rs:20-35`):
+```
+GET {base}/info → if !status.is_success() → error;
+member-required := info.supported_nips.contains(43)
+```
+So the client's "does this relay require membership?" test is literally **"is 43 in supported_nips"**.
+"Am I a member" is a **separate** step: the client reads the relay's replaceable **kind:13534
+membership list** event (`KIND_NIP43_MEMBERSHIP_LIST`) via a normal query and checks if its pubkey is
+in it (`get_my_relay_membership`, `relay_members.rs:57-88`) → `{"member": <role|null>}`.
+`/info` itself returns no per-user membership. A non-200 from `/info` is treated as a hard error by
+the client (no membership assumption).
+
+---
+
+## 4. WebSocket dialect
+
+WS upgrade on `GET /` (content-negotiated against NIP-11). Verbs parsed in `protocol.rs:16-168`
+(`ClientMessage`) and emitted in `protocol.rs:178-210` (`RelayMessage`). It's **vanilla Nostr relay
+NIP-01 + NIP-42**, no Buzz-only verbs on the wire:
+
+Client→relay: `["EVENT",<event>]`, `["REQ",<subId>,<filter>...]`, `["COUNT",<subId>,<filter>...]`,
+`["CLOSE",<subId>]`, `["AUTH",<event>]`.
+Relay→client: `["EVENT",<subId>,<event>]`, `["EOSE",<subId>]`, `["OK",<id>,<bool>,<msg>]`,
+`["CLOSED",<subId>,<msg>]`, `["NOTICE",<msg>]`, `["AUTH",<challenge>]`.
+
+### NIP-42 AUTH flow (mandatory, connection-first)
+1. On connect the relay **immediately sends `["AUTH", <challenge>]`** before anything else
+   (`connection.rs:157-191`, `RelayMessage::auth_challenge` = `["AUTH", challenge]`). It also acquires
+   a connection semaphore permit first.
+2. Client has **`AUTH_TIMEOUT` = 5s server-side** (`connection.rs:27`) to return a signed AUTH event,
+   else the connection is dropped. Client-side auth timeout is **25s** (`relayClientSession.ts:63`).
+3. Client builds a kind:22242 AUTH event with `createAuthEvent({challenge, relayUrl})`
+   (`relayClientSession.ts:856-871`) — the **`relay` tag = the client's own relay WS URL**. Sends
+   `["AUTH", event]`.
+4. Server (`handlers/auth.rs:handle_auth`) verifies: challenge matches the pending one, signature
+   valid, and the event's `relay` tag matches the tenant-expected relay URL (NIP-42 standard). Pure
+   crypto — no tokens/JWT/DB. On closed relays it also runs `enforce_relay_membership` (with NIP-OA
+   `auth` tag delegation extracted from the signed event, `extract_auth_tag_json` `auth.rs:~30`;
+   **>1 `auth` tag ⇒ treated as none**, fail-closed).
+5. Success → `["OK", <authEventId>, true, ""]`, connection state → Authenticated.
+   Failure → `["OK", <authEventId>, false, "auth-required: verification failed"]` and state → Failed.
+   A banned principal → `["OK",id,false,<reason>]` then immediate socket close.
+   Already-authed / already-failed AUTH → `["OK",id,false,"auth-required: already ..."]`.
+6. **REQ before auth** → the subscription is refused with `["CLOSED",subId,"auth-required:
+   authenticate before subscribing"]` / `"auth-required: not authenticated"` (`req.rs:78-82`).
+
+**Client-side terminal rule**: a `kind:22242` `OK=false` marks the session **terminal — no reconnect**
+until the user re-engages (community switch / explicit preconnect) (`relayReconnectPolicy.ts` doc +
+`relayClientSession.ts:921 resetConnection(err,{reconnect:false})`). This is the ONLY thing that
+makes a session non-reconnecting.
+
+### REQ → EOSE
+`req.rs:43`: register subscription, deliver historical events (`["EVENT",subId,ev]` each), then
+**always** `["EOSE",subId]` (`req.rs:408`, and every early-return path also EOSEs — empty/no-access →
+immediate EOSE, `req.rs:523/730`). Live events stream as `["EVENT",subId,ev]` after EOSE. NIP-50
+search REQ hits Postgres FTS then EOSEs (`req.rs:418`).
+
+### What triggers re-AUTH
+There's no periodic re-AUTH. Re-auth happens **only on reconnect** (new socket → new challenge). The
+client caches `relayUrl` and re-runs `handleAuthChallenge` on each fresh connection. A `["CLOSED",
+subId, "auth-required: ..."]` on a live sub triggers `handleRelayClosed` which re-sends the REQ (with
+reconnect-retry) rather than a bare re-auth (`relayClientSession.ts:832-843`).
+
+---
+
+## 5. Rate limiting (HTTP 429)
+
+Server (`bridge.rs:30-66 enforce_http_admission`): per-principal quota
+`rate_limits.human_api_calls_per_min` over a 60s window. On exceed →
+**`429 {"error":"rate-limited: quota exceeded; retry in <N>s"}`**. No `Retry-After` header — the
+retry hint is **embedded in the body string** in the canonical form `... retry in <N>s`. Shared
+admission unavailable → `503 {"error":"rate-limited: shared admission unavailable"}`. The same
+`retry in Ns` grammar is also used in WS `CLOSED`/`NOTICE` messages.
+
+Client (`desktop/src-tauri/src/relay.rs:233-295`, `relay_admission.rs`):
+- `extract_retry_in_hint(body)` finds `"retry in "` and parses the integer seconds (`relay.rs:237`).
+  Overflow/garbage → `None`.
+- On 429 → `activate_rate_limit(capped_hint)` arms a **process-wide shared gate**; all relay HTTP
+  calls `wait_for_rate_limit()` before `.send()`. Hint-less 429 → **10s default**
+  (`DEFAULT_RATE_LIMIT_SECONDS`); hint is capped at a max; overlapping 429s extend, never shorten,
+  the window. Gate is reset per-community switch so community A's 429 can't stall B.
+- WS `NOTICE` starting `"rate-limited:"` also arms the TS gate (`relayClientSession.ts:846-852`).
+
+**Contract for the bridge**: emit `429` with body `{"error":"rate-limited: ... retry in <N>s"}` (or
+omit the hint to get the client's 10s default). A `Retry-After` header is ignored.
+
+---
+# Buzz server-side thread metadata — exact semantics @ v0.4.24
+
+Anchor: `block/buzz` commit `710ed9fff57878a1d69f809b80a6ee0416c53fc4` (Buzz Desktop 0.4.24).
+
+All file:line refs below are at that commit. Three files carry the whole system:
+
+- `crates/buzz-relay/src/handlers/ingest.rs` — ancestry resolution + reject/accept gate (`resolve_nip10_thread_meta`, L563-716).
+- `crates/buzz-db/src/thread.rs` — storage, counters, read queries.
+- `crates/buzz-relay/src/handlers/side_effects.rs` — live 39005 fan-out (`emit_live_thread_summary`, L724-810).
+- `crates/buzz-relay/src/api/bridge.rs` — `include_summaries` query overlay (L534-556).
+- `crates/buzz-core/src/kind.rs` — kind constants.
+
+---
+
+## 1. thread_metadata computation at ingest
+
+### 1.1 Where and when it runs
+
+For every event whose kind is in `requires_h_channel_scope(...)` (ingest.rs L455-484 — the stream-message family kinds 9 / 40002-40008, canvas, forum post/vote/comment, most NIP-29 admin kinds, huddle lifecycle kinds; NOT reactions, NOT create-group) **and** that carries a resolvable channel, ingest calls `resolve_nip10_thread_meta(community, event, channel_id, state)` (ingest.rs L2220-2230). The result is threaded into the same DB transaction as the event insert via `insert_event_with_thread_metadata` (L2392-2399).
+
+Reactions (kind 7) are handled on a **separate** branch (L2245+, NIP-25 last-e-tag target) and do **not** go through the NIP-10 reply-ancestry path — they never create reply thread rows.
+
+### 1.2 Which tags exactly (marked NIP-10 only)
+
+`resolve_nip10_thread_meta` scans `event.tags` and only considers a tag when `parts.len() >= 4 && parts[0] == "e"` and `parts[3]` (the marker) is `"root"` or `"reply"`, and `parts[1]` is exactly 64 lowercase-or-mixed hex chars (ingest.rs L573-586). Marker `"mention"` and any other value are ignored. **Positional / bare `["e", <id>]` tags (len < 4, no marker) are entirely ignored.** Buzz does NOT implement the NIP-10 positional convention.
+
+Consequence: an event whose only e-tags are positional (or `mention`, or only a `root` marker — see below) is treated as **non-threaded** — `resolve_nip10_thread_meta` returns `Ok(None)`, the event is stored as an ordinary top-level channel message (`depth IS NULL`, no thread_metadata row). It is **not** rejected.
+
+### 1.3 Marker combination → (root, parent) resolution (L588-596)
+
+| root marker | reply marker | outcome |
+|---|---|---|
+| absent | absent | `Ok(None)` — top-level, no metadata |
+| present | absent | **`Ok(None)` — top-level** (only-root is NOT treated as a reply) |
+| absent | present | parent = reply-id, **root = reply-id** (direct reply to a root) |
+| present | present | parent = reply-id, root = root-id |
+
+The only-root arm (`(Some(_), None) => return Ok(None)`, L595) is a genuine surprise: a client that tags only `["e", root, "", "root"]` gets a flat top-level message, not a thread reply.
+
+### 1.4 Parent-must-exist + server-verified ancestry (L598-695)
+
+Once (root_hex, parent_hex) is chosen:
+
+1. **Parent must exist** — `get_event_by_id(community, parent_bytes)` → `.ok_or("reply parent not found")` (L608-610). Missing parent ⇒ `Err` ⇒ ingest maps to `IngestError::Rejected("invalid: reply parent not found")` (L2224). **Orphan / out-of-order replies are REJECTED, not stored flat.**
+2. **Parent channel match** — parent must belong to the same channel; parent in a different channel ⇒ reject `"parent event belongs to a different channel"`; parent with no channel ⇒ reject `"parent event has no channel association"` (L612-618).
+3. **Server-verified root** — the client-supplied root must equal the server-derived effective root, else reject `"root tag does not match thread ancestry"` (L633-635, L677-679). The client cannot lie about the root.
+   - If the parent has a thread_metadata row (`Some(meta)`, L630-651): `effective_root = meta.root_event_id ?? parent_bytes`; `depth = meta.depth + 1`.
+   - If the parent has no row (`None`, L652-694 — parent is itself a root, since roots get no row until their first reply): server re-derives the parent's own root by scanning the parent's `root`-then-`reply` e-tags, defaulting to the parent id. `depth = 1` if that derived root == parent, else `2` (clamped — this branch never yields depth > 2).
+4. **Depth cap 100** — in the `Some(meta)` branch only, `if depth > 100 { return Err("thread depth limit exceeded") }` (L646-649). Depth 100 is allowed; the 101st level is rejected. (The `None` branch tops out at 2, so no cap needed there.)
+5. **broadcast flag** — set true iff the event carries `["broadcast","1"]` (L697-700).
+
+Timestamps `parent_event_created_at` / `root_event_created_at` are derived from the referenced events' `created_at` (needed as partition-key components for the counter UPDATEs), falling back to `parent_created` / `Utc::now()` when the row can't be fetched.
+
+### 1.5 Storage layout (`crates/buzz-db/src/thread.rs`)
+
+`thread_metadata` primary key = **`(community_id, event_created_at, event_id)`** — the partition key the fork plan names. Parent and root are stored *with their own created_at* (`parent_event_created_at`, `root_event_created_at`) so the increment UPDATEs can address the parent/root rows by their partition key (L134-150).
+
+`ThreadMetadataRecord` (L84-108) columns: `event_id`, `event_created_at`, `community_id`(implied), `channel_id`, `parent_event_id` (Option), `root_event_id` (Option), `depth` (i32, root = 0), `reply_count` (i32), `descendant_count` (i32).
+
+**Two counters, different meaning:**
+- `reply_count` = number of **direct** children of that node.
+- `descendant_count` = number of **all** nested descendants (the whole subtree). Lives on the root.
+
+Roots get **no** thread_metadata row on first insert (a plain depth-0 message). The row is created lazily as a *stub* the first time a reply needs to bump it (L158-205): `insert_thread_metadata` INSERTs the reply's own row, then `INSERT ... ON CONFLICT DO NOTHING` a stub row for the parent and (if different) the root, then `UPDATE reply_count = reply_count + 1, last_reply_at = NOW()` on the parent (L205-217) and `UPDATE descendant_count = descendant_count + 1` on the root (L219-230). A direct reply to a root bumps BOTH: parent.reply_count and root.descendant_count — and when root == parent both UPDATEs address the same row.
+
+**`last_reply_at = NOW()`** — server wall-clock at ingest, **not** the reply's `event.created_at` (L210). This is a LWW-ish "freshness" stamp keyed on receive time.
+
+**`participants` is NOT stored.** It is derived at read time (get_thread_summary L517-540; get_channel_window batch L698-737): `DISTINCT pubkey` over the subtree, ordered by `MAX(created_at) DESC`, **capped at 10**.
+
+Counter reversal on delete: `decrement_reply_count` (L292-322) mirrors the increment exactly — `reply_count = GREATEST(reply_count - 1, 0)` on parent, `descendant_count - 1` on root, floored at 0. `get_thread_metadata_by_event` (L755-810) is used by the delete path to look up parent/root before decrementing.
+
+### 1.6 Read surface + `include_summaries`
+
+- `get_thread_replies(community, root, depth_limit, limit, cursor)` (L345-486) — all rows under a root, keyset-paginated on `(event_created_at ASC, event_id ASC)` (the tie-safe composite cursor — a timestamp-only cursor silently drops same-second ties, L339). Bridge exposes this via `POST /query` with a `depth_limit` extension field.
+- `get_channel_window(...)` (L565-751) — the top-level timeline. **Top-level predicate (L597-600): `tm.depth IS NULL OR tm.depth = 0 OR (tm.depth = 1 AND tm.broadcast = true)`.** i.e. roots, non-reply messages, and *broadcast* depth-1 replies are rows; ordinary replies never are. Each row carries an optional `thread_summary` (reply_count / descendant_count / last_reply_at + batch-filled participants).
+- `POST /query` with `include_summaries` (bridge.rs L534-556): for each window row that has a summary, the relay appends one relay-signed **kind 39005** overlay event (same shape as §2). Rows without replies get no overlay. A single **kind 39006** window-bounds overlay (`has_more` / `next_cursor`) is always appended (L559-575).
+
+---
+
+## 2. Live thread-summary emits (kind 39005)
+
+`emit_live_thread_summary(tenant, state, channel_id, root_id)` (side_effects.rs L724-810), called fire-and-forget from ingest *after* the reply commits (ingest.rs L2448-2455), only when the event produced thread_meta (i.e. it was an accepted reply).
+
+- **Kind: 39005** (`KIND_THREAD_SUMMARY`, kind.rs L299) — an addressable/parameterized-replaceable kind (30000-39999).
+- **Recompute:** re-reads `get_thread_summary(community, root_id)` (exact, because counters were committed in the reply's transaction). If the root row is gone (`Ok(None)`) it silently returns.
+- **Payload (content = JSON string):**
+  ```json
+  {"reply_count": <i32>, "descendant_count": <i32>,
+   "last_reply_at": <unix_seconds|null>, "participants": ["<hex_pubkey>", ...]}
+  ```
+- **Tags:** `["e", root_hex]`, `["d", root_hex]`, `["h", channel_id]`. The `d = root_hex` makes it replaceable per (relay-pubkey, root) — newest wins.
+- **Signed by the relay keypair** (`state.relay_keypair`), not the author.
+- **Fan-out:** published to Redis `EventTopic::Channel(channel_id)` first (cross-pod), then to local WS subscribers via `fan_out_event_to_local_subscribers`. So it reaches any REQ subscription matching the channel's `h`-tag (kind 39005).
+- **Idempotency / ordering (client-side):** because 39005 is addressable on `d=root` and relay-signed, clients keep only the newest `created_at` per root; the emit is fan-out-only and best-effort (a dropped one is corrected by the next reply's emit or by a page's `include_summaries` overlay — "one contract, two doors", side_effects.rs L752-753). Client-submitted 39005/39006 are **rejected at ingest** (only the relay may author them).
+
+---
+
+## 3. NIP-29 enforcement at ingest (what's enforced vs passed through)
+
+The relay is a NIP-29-style managed relay; "group" == channel == `h`-tag == a `community`/`channel_id`.
+
+Enforced at ingest (ingest.rs):
+- **`h`-tag scoping:** channel-scoped kinds (`requires_h_channel_scope`, L455) MUST carry an `h` tag; missing ⇒ reject `"channel-scoped events must include an h tag"` (L1715). The `h` value resolves the `channel_id`/community; token channel must match (`check_token_channel_access`).
+- **Membership:** for channel-scoped writes, `check_channel_membership` (L493-523) requires the author to be a cached member **OR** the channel to have `visibility == "open"`; else reject `"restricted: not a channel member"`. Skipped for join (9021) and create-group (9007) — see `skip_membership` L1770-1776.
+- **Admin kinds:** NIP-29 admin kinds (9000 put-user, 9001 remove-user, 9002 edit-metadata, 9005 delete-event, 9008 delete-group, 9009 create-invite, 9022 leave; 9007 create-group creates the channel) run per-kind role/authority checks (`validate_admin_event`). Group-state kinds 39000-39003 (metadata/admins/members/roles) and 39005 thread-summary are **relay-authored only** — client submissions rejected.
+- **Relay-admin kinds** (NIP-43, 9030-9032) must use a **global** token, not a channel-scoped one (L1512-1514).
+- **Kind range / numeric bounds:** created_at / kind numeric sanity (0..=MAX_SAFE_INTEGER, L1220); freshness ±120s when relay-membership mode is on (L1827).
+
+Passed through (not semantically enforced): ordinary message content, arbitrary non-marker tags, `broadcast` (recorded, not authorized), positional e-tags (ignored, not rejected).
+
+---
+
+## 4. Does ingest assume a single serialized writer? — YES.
+
+The counter maintenance is a classic transactional read-modify-write:
+
+- `insert_thread_metadata` performs INSERT(reply row) + `INSERT ... ON CONFLICT DO NOTHING`(parent/root stubs) + `UPDATE ... reply_count + 1` + `UPDATE ... descendant_count + 1` **inside the same Postgres transaction as the event insert** (ingest.rs L2392-2399 comment "updated in the same transaction as the insert"; thread.rs L109-114 "crash between them cannot leave reply_count/descendant_count inconsistent … (F9)"). Idempotency is provided by "only bump if the row was actually inserted (not a duplicate)" (thread.rs L155-157).
+- **Ancestry resolution reads committed state** (`get_event_by_id`, `get_thread_metadata_by_event`) and *rejects* when the parent isn't yet present. This is only correct under a serialized, read-your-writes store.
+
+An eventually-consistent gossip backend (x0x) must emulate three things the SQL layer gets for free:
+1. **Counters → CRDTs.** `reply_count` / `descendant_count` must become idempotent, commutative counters (PN-Counter or an OR-Set of contributing event-ids reduced to a count) keyed by event-id so a replayed reply can't double-count. The insert-guard dedup must survive re-delivery.
+2. **Orphan / out-of-order arrival.** The "parent must exist at ingest ⇒ reject" rule cannot hold when a reply can gossip ahead of its parent. Bridge v2 must **park orphans and backfill depth/ancestry when the parent lands**, or accept-and-recompute — not reject.
+3. **`last_reply_at = NOW()`** is receive-wall-clock and thus non-deterministic across replicas; a convergent emulation should prefer `max(reply.event.created_at)` as an LWW register so all replicas agree. `participants` is already an OR-Set-shaped derivation (distinct pubkeys, recency-capped at 10) and ports cleanly.
+
+Server-verified ancestry (client root must match derived root) also needs re-expression: with deferred parents, verification must run at backfill time, and a mismatch should quarantine rather than hard-reject a gossiped event that peers already hold.
+
+exec
+/bin/zsh -lc "sed -n '241,360p' m1a-recon/dialect.md; sed -n '1,220p' m1a-recon/bridge-v2-m1a.md; sed -n '1,460p' m1a-recon/tests.md" in /private/tmp/claude-501/-Users-davidirvine-Desktop-Devel-projects-x0x/bd2e18ed-68f8-4883-bb4f-30b27b6c2ae1/scratchpad
+ succeeded in 0ms:
+
+## 6. Reconnect / shutdown contract (v0.4.24)
+
+Server graceful shutdown (`main.rs:1099-1150`, `state.rs:336-372`):
+- On SIGTERM: set `shutting_down`, start **30s graceful drain**, and call
+  `conn_manager.drain_all()` which sends **every live WS connection a Close frame with code
+  `1012` (Service Restart), reason `"relay restarting"`** (`state.rs:368 restart_close_frame`,
+  `CloseFrame{ code:1012, reason:"relay restarting" }`), then cancels each connection.
+  Late-registering connections during the drain window also get the 1012 (`state.rs:236`).
+- During the pre-drain grace window, **new** HTTP/WS hits on `/` get
+  `503 "relay restarting"` (`router.rs:306-310`).
+
+Client keys off the close code (`relayReconnectPolicy.ts:45-66`, `relayClientSession.ts:772-776`):
+- The Tauri WS plugin delivers a message `{type:"Close", data:{code, reason}}`. `isWebSocketClose`
+  = `message.type === "Close"`. `isServiceRestartClose` = that **AND `data.code === 1012`**.
+- On a **1012** close → **reset reconnect backoff to base (1s)** = fast-track reconnect (#2579):
+  `if (isServiceRestartClose(message)) this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS`
+  (`relayClientSession.ts:773-774`), then `resetConnection`. Any other close code → normal exponential
+  backoff (base 1s, ×2, cap 30s, ±25% jitter — `relayClientSession.ts:985-993`,
+  `RECONNECT_BASE_DELAY_MS=1000`, `RECONNECT_MAX_DELAY_MS=30000`).
+- Backoff only resets to base after a connection stays **stable for `BACKOFF_RESET_STABLE_MS`**
+  post-AUTH (`relayClientSession.ts:589-592`) — flapping doesn't erase backoff. 1012 is the exception
+  that resets immediately.
+- `shouldScheduleReconnect` (`relayReconnectPolicy.ts:32-39`): reconnect only if NOT terminal, NOT
+  already pending, NO live socket, AND (keepAlive requested OR live subscriptions). Failed initial
+  dial (#2564) still schedules via the `ensureConnected().catch(scheduleReconnect)` loop
+  (`relayClientSession.ts:995-1000, 1090`).
+
+**Contract for the bridge**: on graceful shutdown/restart, send WS Close **1012 "relay restarting"**
+to every connection (so clients fast-reconnect instead of eating full backoff), and answer new
+requests with `503` during drain. A plain TCP reset / 1006 works but costs the client full backoff.
+
+---
+
+## 7. Kind passthrough — what's opaque vs special-cased
+
+Kind constants live in `buzz_core::kind` (the 59 `KIND_*`). The relay stores+serves **most kinds
+opaquely** (standard NIP-01 insert + filter match). Special-case server logic is limited to:
+
+**Ingest side-effects** (`handlers/side_effects.rs:148,292` `match kind`):
+- `9000..=9022` — NIP-29 group moderation commands (execute an action, not just store).
+- `9002`, `9007` — archive / unarchive requests (`side_effects.rs:266,283`).
+- `0` (metadata), `KIND_AGENT_PROFILE` → `handle_agent_profile`; `KIND_GIT_REPO_ANNOUNCEMENT` →
+  `handle_git_repo_announcement`; `41001..=41003`, `40099` — replaceable/thread-meta special paths.
+- Relay **emits** (relay-signed, not client-writable): `KIND_MEMBER_ADDED/REMOVED_NOTIFICATION`,
+  `KIND_NIP29_GROUP_METADATA/ADMINS/MEMBERS`, `KIND_NIP43_MEMBERSHIP_LIST` (kind:13534, single
+  replaceable member list), `KIND_THREAD_SUMMARY` (39005), `40099`.
+
+**Read/query special-casing** (`bridge.rs` + `req.rs`):
+- `KIND_PRESENCE_UPDATE` / `KIND_PRESENCE_SNAPSHOT` — **synthesized from Redis**, never persisted or
+  DB-queried (`synthesize_presence` `bridge.rs:1920`); ephemeral.
+- `KIND_THREAD_SUMMARY` (39005) + `KIND_WINDOW_BOUNDS` (39006) — **synthetic relay-signed overlays
+  injected into /query results**, never stored (thread agent covers 39005 detail).
+- Aux closure kinds: `KIND_DELETION`(5), `KIND_REACTION`(7), `KIND_NIP29_DELETE_EVENT`,
+  `KIND_STREAM_MESSAGE_EDIT` (`req.rs:385-393`).
+- Access-gated read classes: **P-gated** (gift wraps, member notifications, observer frames — need
+  `#p`=self), **engram** (need self authors/#p), **author-only** (`AUTHOR_ONLY_KINDS` — need
+  authors=self). Enforced identically on WS REQ and HTTP /query.
+- Ingest validation kinds (`event.rs:1141-1197`): `KIND_AGENT_OBSERVER_FRAME`, `KIND_CANVAS`,
+  `KIND_FORUM_POST/VOTE/COMMENT`, `KIND_STREAM_MESSAGE/_DIFF`, `KIND_PRESENCE_UPDATE`,
+  `KIND_DM_VISIBILITY` get structural validation beyond generic event checks.
+
+Everything else = opaque store + filter-serve.
+
+---
+
+## Skipped (M1b / cut) — location pointers
+- Media/Blossom: `api/media.rs`, `/upload` `/media/upload` (`router.rs:38-41`).
+- Invites/join-policy: `api/invites.rs`, `/api/invites*`, `/api/join-policy` (`router.rs:95-111`).
+- Huddle audio: `/huddle/{channel_id}/audio` WS (`router.rs:~120`), `audio/`.
+- Git smart-HTTP: `api/git/*`.
+- Pairing / NIP-11 push descriptor detail: `nip11.rs:push_descriptor` (APNs), `pairing_relay_url`.
+- Operator/moderation admin: `/operator/*`, `/moderation/*`, `/api/admin/v1/*`.
+# Bridge v2 — M1a design: stock Buzz desktop on the x0x mesh
+
+**Status:** Draft for consensus review
+**Date:** 2026-07-24
+**Inputs:** four recon reports at Buzz anchor `710ed9ff` (0.4.24) — `dialect.md`
+(wire contract), `thread.md` + `thread-fixtures.json` (thread semantics +
+vectors), `tests.md` (conformance gate), `spike.md` (reuse matrix). This doc is
+the synthesis; the recon docs are the normative detail and ship in
+`docs/recon/` alongside it.
+**Parent plan:** tic-tac-toe `docs/design/buzz-fork-plan.md` (M1a row table).
+
+## 1. Goal and acceptance
+
+Goal: Block's stock Buzz desktop client (0.4.24), in relay mode, works against
+`x0x-nostr-bridge` instead of `buzz-relay` — no Postgres, no Redis, no Block
+infrastructure; durable state in bridge SQLite, live propagation over the x0x
+mesh.
+
+**Acceptance (the gate):** with one bridge on `http://localhost:3000` (+ WS
+same port) and one x0xd:
+
+1. `assertRelaySeeded()` passes (kind-39000 for `general` served within the
+   seed deadline, `X-Pubkey` honored, `Host: localhost:3000` not 404'd).
+2. These tic-tac-toe relay-config specs green, run via
+   `pnpm test:e2e:integration`:
+   `integration.spec.ts`, `stream.spec.ts`, `dm-double-notification.spec.ts`,
+   `parity-ancestor-island.spec.ts`.
+3. Thread conformance unit suite green against the mined vectors
+   (`thread-fixtures.json`, 8–15 scenarios incl. only-root, orphan-reject,
+   depth-cap, same-second keyset ties).
+4. The four graduated-spike hardening issues closed (NIP-11 test, connection
+   cap, NIP-42 relay-tag, mutex pruning).
+
+Explicitly **out of M1a**: media/Blossom, invites/join-policy, huddle, git,
+pairing, two-relay live gate, 1012 graceful-drain spec (skip-by-default
+upstream; we implement 1012 as a cheap stretch, see WP3), presence synthesis
+(gate never queries it; return empty), multi-tenant Host maps, 429
+*enforcement* (grammar implemented, limiter off by default).
+
+## 2. Architecture decisions
+
+- **D1 — One bridge instance = one community = the serialized writer.** This
+  mirrors Buzz's own model (one relay per community) and is what makes the
+  transactional thread-counter semantics implementable without CRDT counters
+  in M1a. Cross-bridge convergence of thread metadata is deliberately deferred
+  (Stage 3 moves thread computation into x0xd's ADR-0023 store; x0x#275/#276
+  are the tracked substrate issues). The spike's two-bridge e2e stays
+  ignore-gated with a doc note: raw events converge; thread counters are
+  per-bridge until Stage 3.
+- **D2 — Two-door ingest.** Local door (HTTP `/events` + WS `EVENT`): strict
+  Buzz semantics — orphan replies REJECTED (`invalid: reply parent not found`),
+  root verified server-side, depth cap 100, counters bumped in the same SQLite
+  transaction. Mesh door (events arriving from x0x gossip): park orphans in a
+  pending table, attach + recompute when the parent lands, quarantine (don't
+  hard-reject) ancestry mismatches. The doors share one validation core.
+- **D3 — Bridge-local SQLite stays authoritative for M1a** (per fork plan).
+  x0xd `/history/*` exists in 0.34.3 but is scope-keyed for x0x payloads, not
+  Nostr filter/window queries; the bridge schema below is purpose-built and
+  becomes the migration spec for Stage 3.
+- **D4 — Relay identity: a persisted secp256k1 keypair** (Nostr wire
+  requirement) signing NIP-11 `self`, 39005/39006 overlays, and the kind-13534
+  membership list. This is a loopback-dialect artifact per the Stage-2
+  identity rules — it authenticates nothing in x0x terms.
+- **D5 — Auth: both doors of Buzz's HTTP auth.** `require_auth_token=false`
+  (default for the gate): accept `X-Pubkey`. `=true`: full NIP-98 verification
+  incl. u/method/payload tags and a TTL replay cache — required before any
+  "stock production client" claim, cheap to build now against dialect.md §0.
+- **D6 — Frozen `proto.rs` gets a v2 module, not edits.** The spike's WS core
+  (dispatch, EOSE-always, FTS) is reused; the new HTTP dialect, window
+  read-model, and thread engine land as new modules behind the existing seams
+  (`handle_event`, `store.insert`, `fts_match_expr`).
+
+## 3. Schema (replaces the flat spike table)
+
+```sql
+events(id TEXT PK, pubkey TEXT, created_at INTEGER, kind INTEGER,
+       tags JSON, content TEXT, sig TEXT, raw JSON,
+       channel_id TEXT,           -- resolved #h
+       deleted INTEGER DEFAULT 0)
+  INDEX (channel_id, created_at DESC, id ASC)   -- window keyset
+  INDEX (kind, created_at DESC)
+thread_metadata(event_id TEXT PK, event_created_at INTEGER,
+       channel_id TEXT, parent_event_id TEXT, root_event_id TEXT,
+       depth INTEGER, reply_count INTEGER DEFAULT 0,
+       descendant_count INTEGER DEFAULT 0, last_reply_at INTEGER,
+       broadcast INTEGER DEFAULT 0)
+  INDEX (root_event_id, event_created_at ASC, event_id ASC)  -- thread keyset
+pending_orphans(event_id TEXT PK, parent_event_id TEXT, raw JSON,
+       received_at INTEGER)                      -- mesh door only
+members(channel_id TEXT, pubkey TEXT, role TEXT, PRIMARY KEY(channel_id,pubkey))
+nip98_seen(event_id TEXT PK, expires_at INTEGER) -- replay cache (D5)
+fts5(content) unchanged from spike
+```
+
+Single-community deployment ⇒ no `community_id` column; the community is the
+process. `(community_id, created_at, id)` partition semantics collapse to
+`(created_at, id)` keyset + PK addressing, preserving Buzz's tie-safe cursor
+contract exactly (`created_at DESC, id ASC` window order; `ASC, ASC` thread
+order).
+
+## 4. Work packages
+
+**WP1 — storage + thread engine** (the redesign; hardest, first):
+schema above; ingest transaction implementing thread.md §1 verbatim (marked
+NIP-10 only; marker table incl. only-root→top-level; parent-must-exist reject
+[local door]; server-verified root; depth cap 100 [Some-branch only];
+lazy parent/root stub rows; reply_count/descendant_count bumps + delete
+decrements floored at 0; `last_reply_at` = wall-clock on local door, `max
+(created_at)` on mesh door; participants derived at read, cap 10; reactions on
+the separate NIP-25 branch, never threaded). Conformance vectors from
+`thread-fixtures.json` are the unit gate. Mesh door parking per D2.
+
+**WP2 — HTTP dialect** (`axum` routes on the spike's server):
+`POST /events` (single event; `{event_id,accepted,message}` 200 envelope;
+error taxonomy per dialect.md §2); `POST /query` (filter array; raw-value
+extension extraction — `top_level`, `include_summaries`, `include_aux`,
+`until`+`before_id` both-or-neither, `thread_cursor(_id)`, `page`,
+`depth_limit`; window read-model assembling rows→aux closure→39005
+overlays→exactly-one 39006 bounds; search routing with
+mixed-filter 400; p-gated/engram/author-only read authorization; limits
+50/200); `POST /count`; `GET /info` NIP-11 (supported_nips advertising 43 only
+when membership enforced; `self` = D4 pubkey); 1 MiB body cap; `{"error":msg}`
+envelope; 429 grammar `retry in <N>s` (limiter default-off); auth per D5.
+
+**WP3 — WS + auth hardening** (closes the 4 graduated-spike issues):
+NIP-42 relay-tag validation (issue #3); connection-first challenge, 5s auth
+timeout, REQ-before-auth → CLOSED `auth-required:`; global connection cap
+(issue #2); NIP-11 active test (issue #1); per-topic forwarder pruning
+(issue #4); relay-authored kinds guard (39000-39003/39005/39006/13534 client
+submissions rejected); live 39005 fan-out post-commit (fire-and-forget,
+replaceable on `d=root`); kind-13534 membership list emission. Stretch: 1012
+drain on SIGTERM + 503 during drain (contract known, spec not in gate).
+
+**WP4 — seed + gate harness**:
+`--seed-demo` (or config): `general` channel kind-39000 (tags incl.
+`["name","general"]`), members tyler/alice/bob/charlie (pubkeys in tests.md
+§3), DM channel `alice-tyler` id = `uuid5(DNS,"buzz.channel.dm.alice-tyler")`;
+Host acceptance for `localhost:3000` (any Host in single-community mode);
+tic-tac-toe justfile recipe `bridge-gate`: build bridge, launch x0xd
+(isolated config, `[update] enabled=false`, no prod bootstraps) + bridge,
+run `pnpm test:e2e:integration`, teardown. CI job in the bridge repo running
+the thread-vector suite; the Playwright gate runs in tic-tac-toe CI (nightly,
+not per-PR, until stable).
+
+**WP5 — mesh binding review**: the spike already maps `#h`→topic and
+pubs/subs via x0xd (5 endpoints, all in 0.34.3). Verify accepted local events
+publish post-commit, mesh-door events route through WP1 parking, and dedupe
+by event id survives gossip redelivery. No new x0xd endpoints required.
+
+Ordering: WP1 ∥ WP2-skeleton → WP2 window model (needs WP1) → WP3 ∥ WP4 →
+gate. WP1 is the critical path.
+
+## 5. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Window read-model fidelity (39006-only pagination; aux closure; ordering) | tests.md §4a is byte-exact; `parity-ancestor-island` + vectors gate ties |
+| Thread semantics divergence | thread-fixtures.json mined from Buzz's own interop tests; two surprising rules (only-root, orphan-reject) documented and vectored |
+| Client never reaches `connected` (NIP-42 nuance) | dialect.md §4 full flow incl. terminal-on-22242-NAK rule; relay-tag fix in WP3 |
+| Spike WS regressions while grafting | spike's 60 tests stay green in CI throughout |
+| Scope creep toward M1b | out-list in §1 is explicit; anything not exercised by the 4 specs + vectors defers |
+# M1a Relay-Mode Conformance Gate — Recon
+
+Read-only recon of `/Users/davidirvine/Desktop/Devel/projects/tic-tac-toe/desktop/`.
+Nothing modified. All paths absolute. File:line refs against the working tree
+as of the session (imported Buzz upstream 0.4.24).
+
+Scope: define the exact contract a drop-in x0x-nostr-bridge must satisfy so
+Buzz's relay-mode Playwright suites pass with our bridge in place of Block's
+`buzz-relay`.
+
+---
+
+## 0. The single most important structural fact
+
+There are **THREE distinct test execution modes**, not one, and only ONE of
+them is the M1a gate:
+
+| Mode | How a spec selects it | Talks to a real relay? | Provisioning |
+|------|----------------------|------------------------|--------------|
+| **Mock** | `installMockBridge(page, …)` (default) | No | none — `e2eBridge.ts` fakes all Tauri IPC |
+| **Relay (config) mode** | `installRelayBridge(page, user)` → `installBridge({mode:"relay"})` | **YES — this is M1a** | external relay at `BUZZ_E2E_RELAY_URL` (default `http://localhost:3000`), pre-seeded out-of-band |
+| **Live gate** | `TwoRelayHarness` spawns a real `buzz-relay` binary | Yes, but **skip-by-default** | spawns `BUZZ_E2E_RELAY_BIN` + needs Postgres + Redis; gated behind `BUZZ_E2E_*=1` |
+
+**M1a = "Relay (config) mode".** The five-minute demo runs the relay-mode
+specs (`installRelayBridge`) against our bridge listening on the
+`BUZZ_E2E_RELAY_URL` endpoint. "Zero relay servers" in the plan means zero
+**Block** relay servers — our bridge is the only server. It does NOT mean the
+`TwoRelayHarness` live gate (that spawns Block's binary and is out of M1a — it
+needs the real Rust relay + Postgres + Redis and is skipped unless explicitly
+enabled).
+
+---
+
+## 1. Playwright topology
+
+Three config files at `desktop/`:
+
+### `playwright.config.ts` (the default; `pnpm test:e2e`)
+- `testDir: ./tests/e2e`, `timeout: 30_000`, `workers: 1`, `retries: CI?2:0`.
+- `use.baseURL: http://127.0.0.1:4173`.
+- `webServer.command: "python3 -m http.server 4173 -d dist"` — serves the
+  **static** `dist` produced by `pnpm build:e2e` (`tsc && vite build --mode
+  e2e`). **No relay is started by Playwright.** `reuseExistingServer: !CI`.
+- **Two projects**:
+  - **`smoke`** (`playwright.config.ts:19-123`) — ~115 explicit `testMatch`
+    globs. All **mock mode**. Includes the deceptively-named
+    `relay-reconnect.spec.ts`, `relay-reconnect-affordance.spec.ts`,
+    `relay-connectivity.spec.ts` — these use the **mock websocket seam**, not a
+    real relay (see §6).
+  - **`integration`** (`playwright.config.ts:124-150`) — 16 `testMatch` globs,
+    `expect.timeout: CI?15000:10000`. **Mixed**: some specs are mock, four are
+    the real relay-mode M1a specs, two are skip-by-default live specs.
+
+### `playwright.live.config.ts` (13 lines, `agents-everywhere` live gate only)
+```ts
+testDir: "./tests/e2e",
+testMatch: "**/agents-everywhere.live.spec.ts",
+timeout: 90_000, workers: 1, reporter: "list",
+```
+No `webServer` (the live spec spawns its own relay via harness). Out of M1a.
+
+### `playwright.perf.config.ts` (perf profiling)
+- `testMatch: ["**/*.perf.ts"]`, `timeout: 60_000`, same static `dist`
+  webServer. Picks up `scrollback-buzzbugs.perf.ts` (which IS relay-mode) and
+  `cold-switch-longtask.perf.ts` (mock). Perf, not a correctness gate — treat
+  as adjacent to M1a, not part of it.
+
+### package.json scripts (`desktop/package.json`)
+```
+test:e2e             = pnpm build:e2e && playwright test
+test:e2e:smoke       = pnpm build:e2e && playwright test --project=smoke
+test:e2e:integration = pnpm build:e2e && playwright test --project=integration
+```
+There is **no dedicated relay-mode script and no globalSetup**. Relay-mode
+specs live inside `--project=integration` and self-provision via each spec
+calling `assertRelaySeeded()` in `beforeAll` (see §2). Running
+`test:e2e:integration` with no relay up will fail the four relay-mode specs at
+`assertRelaySeeded()` and pass the mock ones.
+
+---
+
+## 2. Relay provisioning — the seam our bridge slots into
+
+There is **no fixture that spawns a relay for config-mode specs**. The relay is
+**external and pre-seeded**. Two helpers define the contract:
+
+### 2a. Client wiring — `tests/helpers/bridge.ts`
+```ts
+const DEFAULT_RELAY_HTTP_URL = process.env.BUZZ_E2E_RELAY_URL ?? "http://localhost:3000";
+const DEFAULT_RELAY_WS_URL   = DEFAULT_RELAY_HTTP_URL.replace(/^http/, "ws");
+
+export async function installRelayBridge(page, user="tyler", options?) {
+  await installBridge(page, {
+    mode: "relay",
+    user,
+    relayHttpUrl: DEFAULT_RELAY_HTTP_URL,   // both transports threaded explicitly
+    relayWsUrl:   DEFAULT_RELAY_WS_URL,
+    seedPreviewFeatures: options?.seedPreviewFeatures,
+  });
+}
+```
+`installBridge` (bridge.ts) does three localStorage seeds via
+`page.addInitScript` before app boot: `seedDefaultCommunity` (stamps a
+community with the active identity's pubkey so onboarding is skipped),
+`seedOnboardingCompletionForKnownIdentities`, `seedPreviewFeaturesEnabled`; then
+sets `window.__BUZZ_E2E__ = { mode, identity, relayHttpUrl, relayWsUrl, … }`.
+In relay mode the identity is `TEST_IDENTITIES[user]`.
+
+### 2b. Readiness gate — `tests/helpers/seed.ts::assertRelaySeeded()`
+Every relay-mode spec calls this in `beforeAll`:
+- callers: `integration.spec.ts:180`, `stream.spec.ts:189`,
+  `dm-double-notification.spec.ts:67`, `parity-ancestor-island.spec.ts:43`.
+- It polls `POST http://localhost:3000/query` with header `X-Pubkey:
+  <tyler>` and body `[{ kinds:[39000], limit:200 }]` until it sees a
+  kind-39000 channel-metadata event whose tags contain `["name","general"]`.
+- Timeout: `BUZZ_E2E_SEED_TIMEOUT_MS` (CI 60s / local 25s), per-request
+  `BUZZ_E2E_SEED_REQUEST_TIMEOUT_MS` (CI 5s / local 2s), retry 1s.
+- **HOST MATTERS**: the relay is multi-tenant and resolves tenant from the
+  `Host` header against a communities host-map, failing closed with **404** on
+  an unmapped host. The seed maps host `localhost:3000`, and `localhost` !=
+  `127.0.0.1` under `normalize_host`. So the whole suite MUST hit
+  `localhost:3000`, never `127.0.0.1:3000`. Our bridge must (a) accept a
+  `Host: localhost:3000` and treat it as the demo community, and (b) either
+  serve kind-39000 for `general` from startup or reconcile seeded data into
+  39000/39002 emits.
+- Failure message literally says: *"Start the relay and run
+  scripts/setup-desktop-test-data.sh."*
+
+### 2c. Out-of-band seed scripts — REFERENCED BUT ABSENT FROM THE TREE
+`start-relay-for-tests.sh` and `setup-desktop-test-data.sh` are **not present**
+anywhere under `tic-tac-toe/` (find returns nothing; only comment references
+exist in `seed.ts:77`, `seedRelay.ts:20,25`, `dm-double-notification.spec.ts:14`).
+They live in the upstream Buzz `buzz-relay` repo, which was **not imported** into
+`desktop/`. What they establish (from the comments):
+- `start-relay-for-tests.sh` runs the relay with `BUZZ_REQUIRE_AUTH_TOKEN=false`
+  so `POST /events` accepts a plain `X-Pubkey` header (dev-auth fallback in
+  `bridge.rs verify_bridge_auth`); the event body is still fully signed, only the
+  per-request NIP-98 envelope is skipped.
+- `setup-desktop-test-data.sh` inserts DB rows the relay reconciles at startup
+  into kind:39000 (channel metadata) / 39002 events, and seeds **tyler, alice,
+  bob, charlie as members of `general`** (required because
+  `enforce_relay_membership` rejects events from non-members). It also creates
+  the DM channel `alice-tyler` with a deterministic id =
+  `uuid5(NAMESPACE_DNS, "buzz.channel.dm.alice-tyler")`.
+
+**Process contract a drop-in bridge must provide (config mode / M1a):**
+1. HTTP endpoint on `http://localhost:3000` (or `BUZZ_E2E_RELAY_URL`) +
+   matching WS on `ws://localhost:3000`.
+2. `POST /query` — accepts a JSON array of Nostr filters (+ Buzz extensions,
+   §4), returns a JSON array of raw Nostr events. Honors `X-Pubkey` as the
+   requester identity. Tenant-resolves on `Host` and does NOT 404 for
+   `localhost:3000`.
+3. `POST /events` — accepts ONE signed Nostr event per request, header
+   `X-Pubkey`, `BUZZ_REQUIRE_AUTH_TOKEN=false` dev-auth path; returns
+   `{ event_id, accepted, message }`.
+4. NIP-42 AUTH over WS (§3) + REQ/EVENT/EOSE/CLOSE (§3).
+5. Pre-seeded community `general` with members tyler/alice/bob/charlie, plus
+   whatever a given spec seeds live via `seedScenario` (§4b). Must serve
+   kind-39000 for `general` on startup so `assertRelaySeeded()` passes.
+6. Channel-window read-model: assemble 39005 summaries + 39006 bounds (§4a) —
+   the single hardest requirement.
+
+The `TwoRelayHarness` (`tests/e2e/helpers/twoRelayHarness.ts`) is a **separate**
+provisioning path used ONLY by the two live specs — it is the closest thing to
+a "process contract" reference and worth mirroring even though it's out of M1a:
+- `startRelays(binary = BUZZ_E2E_RELAY_BIN)` spawns with env:
+  `DATABASE_URL`, `REDIS_URL`, `RELAY_URL=ws://127.0.0.1:{main}`,
+  `BUZZ_BIND_ADDR=127.0.0.1:{main}`, `BUZZ_HEALTH_PORT`, `BUZZ_METRICS_PORT`,
+  `BUZZ_REQUIRE_AUTH_TOKEN=false`, `BUZZ_RECONCILE_CHANNELS=true`.
+- Readiness: `GET http://127.0.0.1:{health}/_readiness` until 200, 30s deadline.
+- Teardown: SIGTERM → 5s → SIGKILL → 2s; process-group kill (`detached`).
+- `terminateRelayGracefully()` SIGTERMs and waits (never SIGKILL) — exercises
+  the graceful drain: readiness 503 → 5s grace → 1012 close broadcast →
+  listener drain. `restartRelay()` re-spawns on the same ports.
+
+---
+
+## 3. Identity / auth in relay mode
+
+### Identities — `tests/helpers/bridge.ts::TEST_IDENTITIES`
+Hardcoded hex keypairs (private + public), shared by client wiring AND
+`seedRelay.ts` signing:
+| user | pubkey (hex) |
+|------|--------------|
+| tyler | `e5ebc6cdb579be112e336cc319b5989b4bb6af11786ea90dbe52b5f08d741b34` |
+| alice | `953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f` |
+| bob | `bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260` |
+| charlie | `554cef57437abac34522ac2c9f0490d685b72c80478cf9f7ed6f9570ee8624ea` |
+(a 5th `df8e91…` identity also exists.) These pubkeys are baked into seeded
+state, so the bridge's membership/ACL must recognise exactly these keys.
+
+### HTTP auth (config-mode reads/writes go through `e2eBridge.ts`)
+`relayJsonRequest`/`relayQuery`/`submitSignedEvent` set header **`X-Pubkey:
+<identity.pubkey>`** and `Content-Type: application/json`. Writes are fully
+signed via `signWithIdentity` (nostr-tools `finalizeEvent`) then `POST /events`.
+There is **no NIP-98 / bearer token** in config mode — the dev-auth fallback
+(`BUZZ_REQUIRE_AUTH_TOKEN=false`) is assumed. Our bridge must accept `X-Pubkey`
+as the caller identity on `/query` and `/events`.
+
+### WS auth — NIP-42 (production client, `src/shared/api/relayClientSession.ts`)
+The **real app** (not the bridge) opens the WS in relay mode and runs NIP-42:
+- `AUTH_TIMEOUT_MS = 25_000` (relayClientSession.ts:63); connection must stay
+  stable a while post-AUTH.
+- On `["AUTH", <challenge>]` (line 805) → `handleAuthChallenge` (line 856) →
+  `createAuthEvent({ challenge, relayUrl })` → `sendRaw(["AUTH", <signed event>])`
+  (line 871). Standard NIP-42 kind-22242 client-auth event.
+- Also handles `CLOSED` (restores subscriptions), `NOTICE rate-limited:` (back-pressure gate).
+- The connection state the tests poll (`__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__`
+  → `relayClient.getConnectionState()`) reaches `"connected"` only after a
+  successful AUTH.
+=> **Our bridge MUST implement the full NIP-42 challenge/response over WS**, or
+the client never reaches `connected` and every relay-mode spec times out.
+
+### Membership
+Established **out-of-band** by `setup-desktop-test-data.sh` (tyler/alice/bob/
+charlie in `general`) plus per-spec `seedScenario` writes. No in-test invite
+flow, no admin HTTP call — invites are M1b. The bridge just has to honour the
+pre-seeded membership set and `enforce_relay_membership` semantics (reject
+non-member authors on `/events`).
+
+---
+
+## 4. The `/query` + `/events` contract (exactly what the client sends)
+
+All from `src/testing/e2eBridge.ts` relay-mode ("Config mode") branches.
+
+### 4a. Channel window read-model — `handleGetChannelWindow` (HARDEST)
+Relay-mode filter sent to `POST /query` (mirrors server `build_channel_window_filter`):
+```json
+{ "#h": ["<channelId>"], "kinds": [<TIMELINE_KINDS>], "limit": <=200 default 50,
+  "top_level": true, "include_summaries": true, "include_aux": true,
+  "until": <cursor.created_at>, "before_id": <cursor.event_id> }   // until+before_id both-or-neither
+```
+Expected response = a **flat event array the relay assembles**:
+1. top-level rows, **newest first**;
+2. the **aux closure** (ancestor/related events needed to render);
+3. relay-signed **kind-39005 thread summaries**;
+4. **exactly one kind-39006 bounds event** carrying `has_more` + `next_cursor`.
+
+The client derives cursor + exhaustion **solely from the 39006 bounds event**,
+never from the rows. Doc comment: *"without it the relay-mode bridge has no
+handler and the timeline renders empty."* This is the primary read path — the
+whole timeline depends on it.
+
+### 4b. Thread pane keyset — `get_channel_messages_before` / thread window
+```json
+{ "#h": ["<channelId>"], "kinds": [<TIMELINE_KINDS>], "until": <before>,
+  "limit": <=500 default 200, "before_id": <beforeId?> }
+```
+and the thread-cursor variant adds `thread_cursor` / `thread_cursor_id`
+(composite `(created_at, event_id)` keyset). Client computes `next_cursor` from
+the last row when `page.length >= cap`. Gap-free `(created_at, event_id)` keyset
+paging — same-second ties must not be skipped or double-served (the exact defect
+`parity-ancestor-island` and `scrollback-buzzbugs.perf` guard).
+
+### 4c. NIP-50 search — `search_messages`
+```json
+{ "kinds": [9, 40002], "search": "<query>", "limit": <default 20> }
+```
+Client maps hits → `{event_id, pubkey, content, created_at, kind, tags, sig,
+channel_id (from "h" tag), channel_name:null, score:1.0}`. So the bridge must
+support the `search` filter field over `/query` for kinds 9 (channel message)
+and 40002.
+
+### 4d. Single event by id — `get_event`
+```json
+{ "ids": ["<eventId>"], "limit": 1 }
+```
+
+### 4e. Writes — `submitSignedEvent` → `POST /events`
+Body = one signed event `{kind, content, tags, id, pubkey, sig, created_at}`;
+returns `{event_id, accepted, message}`. Canonical Buzz tag shapes (from
+`seedRelay.ts`, mirroring `buzz-sdk builders.rs`):
+- top-level: `["h", channelId]` (no e-tag → thread depth NULL)
+- direct reply: `["e", parentId, "", "reply"]`
+- nested reply: `["e", rootId, ...]` + reply marker
+
+### 4f. p-gated filter authorization
+`relayQuery` refuses to send a filter unless `isPGatedFilterAuthorized(filter,
+identity.pubkey)` — i.e. any `#p`-scoped query must include the caller's own
+pubkey. Client-side guard; the bridge just needs to behave consistently for
+p-tag scoped reads (DM inbox).
+
+---
+
+## 5. Multi-relay / multi-community
+
+**M1a is single-relay, single-community, multi-client.** The four config-mode
+specs use up to two browser contexts (`installRelayBridge(pageOne,"tyler")` +
+`installRelayBridge(pageTwo,"alice")`) but both point at the **same**
+`BUZZ_E2E_RELAY_URL` and the same `general` community. Cross-user delivery is
+tested by two clients on one relay, not two relays.
+
+Only `agents-everywhere.live.spec.ts` uses **two relays** (`TwoRelayHarness`
+with two `RelaySpec`s) — and that is a skip-by-default live gate, not M1a.
+
+=> **Bridge v2 does NOT need multi-instance or multi-community-per-instance for
+the M1a gate.** One bridge instance serving one community (host `localhost:3000`)
+with multiple authenticated clients is sufficient. (Multi-relay-per-community is
+Buzz's model = one relay per community anyway; M1a never exercises >1.)
+
+---
+
+## 6. The 0.4.24 reconnect additions & the e2eBridge seam
+
+### `relay-reconnect.spec.ts` / `relay-reconnect-affordance.spec.ts` — MOCK, not real relay
+These are in the **smoke** project and drive the **mock websocket seam** in
+`e2eBridge.ts`, NOT a real relay:
+- `window.__BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__()` — disconnects mock sockets.
+- `window.__BUZZ_E2E_RESTART_MOCK_WEBSOCKETS__()` — sends `sendWsClose(handler,
+  1012, "relay restarting")` to each mock socket (synthesises the 1012 the
+  reconnect UI reacts to).
+- `window.__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__(state)` — pokes the production
+  `relayClient.connectionStateEmitter` directly to drive degraded UI without a
+  real ~10s auth-timeout/reconnect cycle.
+So the client's 1012 handling is proven **against a mock**, and these specs need
+**nothing from our bridge** — they pass in mock mode regardless.
+
+### `relay-restart.live.spec.ts` — real relay, skip-by-default (NOT M1a)
+Gated `test.skip(BUZZ_E2E_RELAY_RESTART !== "1")`. Boots a real relay via
+`TwoRelayHarness`, `installBridge({mode:"relay", user:"tyler", relayHttpUrl,
+relayWsUrl})`, waits for `connectionState === "connected"`, SIGTERMs the relay
+(graceful drain: readiness 503 → 5s grace → **1012 close broadcast** → listener
+drain), restarts on the same port, asserts the client returns to `"connected"`.
+This is the only test that requires the **server** to emit a real 1012 on
+graceful shutdown + accept a fresh dial on the same port. Needs
+`BUZZ_E2E_RELAY_BIN` + `BUZZ_E2E_DATABASE_URL` + Redis. **Out of M1a** unless we
+choose to also make our bridge honour SIGTERM→1012→restart (a later milestone).
+
+### The "Relay state seam is not installed" flake
+`connectionState(page)` reads `window.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?.()
+?? "uninstalled"`. That seam is wired at the **end** of `e2eBridge.ts install()`
+(`installed = true`), which runs when the app bootstraps the mocked
+`__TAURI_INTERNALS__`. The flake = the spec calls `connectionState()` /
+`__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__` **before** `install()` has completed
+(before `page.goto("/")` has booted the app + constructed the `relayClient`
+singleton). The seam exposes the production `relayClient`'s connection state
+(`getConnectionState()`), so it only exists once the app module graph has run.
+It is a client-side ordering issue, **not a bridge requirement** — but any M1a
+spec that polls connection state must `await page.goto("/")` and poll with a
+timeout (the live spec uses `expect.poll(..., {timeout:60_000})`).
+
+---
+
+## 7. Relay-mode spec inventory (the M1a gate)
+
+Config-mode specs (`installRelayBridge`, need our bridge on `localhost:3000`),
+all in `--project=integration` except the perf one:
+
+| Spec | Purpose | Assertion focus |
+|------|---------|-----------------|
+| `tests/e2e/integration.spec.ts` | Core relay round-trips: create channel, two users see same channel, message delivery across users, live mention refetch of home feed, DM channel appears + send DM, forum channel | channel list from `/query`, cross-client delivery via WS live REQ, home-feed/inbox live update, DM path, `message-timeline` contains text |
+| `tests/e2e/stream.spec.ts` | Relay-backed streaming/timeline: loads channels + home feed from relay, sends through real relay, real-time delivery to 2nd context, scroll-pinning (bottom-pin, pin after send+remote reply, composer growth, arrivals above fold) | live EVENT fan-out, timeline pinning/scroll under real relay latency |
+| `tests/e2e/dm-double-notification.spec.ts` | An incoming DM produces exactly ONE desktop notification | DM delivery + notification dedupe; DM channel id = `uuid5(DNS,"buzz.channel.dm.alice-tyler")` |
+| `tests/e2e/parity-ancestor-island.spec.ts` | Thread history frontier: an ancestor island does not strand the frontier (Dawn/Wren cursor-poisoning root cause) | thread `/query` keyset, gap-free paging, `seen.size > GAP_COUNT*0.9` |
+| `tests/e2e/scrollback-buzzbugs.perf.ts` | (perf, not correctness) scroll-back latency of the read-model window | one 50-row page per trigger, composite `(until,before_id)` keyset, 39006 bounds — perf profile |
+
+Skip-by-default live specs (real binary, **NOT M1a**):
+`agents-everywhere.live.spec.ts` (two-relay agent gate,
+`BUZZ_E2E_AGENTS_EVERYWHERE=1`), `relay-restart.live.spec.ts`
+(`BUZZ_E2E_RELAY_RESTART=1`).
+
+Relay-*named* but mock (NOT relay-mode, pass without our bridge):
+`relay-reconnect.spec.ts`, `relay-reconnect-affordance.spec.ts`,
+`relay-connectivity.spec.ts`, `sidebar-relay-card.spec.ts`,
+`relay-restart` mock paths.
+
+### What M1a explicitly does NOT need
+Media/Blossom (`PUT /upload`, `GET /media/*`, `buzz-media://`) is **M1b**.
+Invites, git/project history kinds, huddle, and the two-relay/agents-everywhere
+live gate are all outside M1a. The mock-mode bulk (screenshots, onboarding,
+channel UI, reactions, reminders, etc.) needs nothing from the bridge.
+
+---
+
+## 8. Showstoppers / risks for a drop-in bridge
+
+1. **The 39005/39006 channel-window assembly (§4a)** is the make-or-break. The
+   client renders an empty timeline unless `POST /query` with
+   `top_level+include_summaries+include_aux` returns rows + aux + kind-39005
+   summaries + exactly one kind-39006 bounds with `has_more`/`next_cursor`. This
+   is a server-side read-model, not plain Nostr filtering — the bridge must
+   compute `thread_metadata` at ingest and emit relay-signed 39005/39006. This
+   is the "riskiest coupling" the plan itself flags.
+2. **NIP-42 AUTH over WS is mandatory** — no `connected`, no tests. Plus
+   REQ/EVENT/EOSE/CLOSE live subscriptions with `#h` and `#p` filters, and
+   CLOSED-subscription restoration.
+3. **Host-based tenant resolution** — the bridge must treat `Host:
+   localhost:3000` as the demo community and NOT 404. `localhost` != `127.0.0.1`.
+4. **Pre-seeded state** — the two absent scripts
+   (`start-relay-for-tests.sh`, `setup-desktop-test-data.sh`) are NOT in the
+   tree; we must reproduce their effect: `general` channel (kind-39000) +
+   tyler/alice/bob/charlie membership + the `alice-tyler` DM channel with the
+   deterministic uuid5 id, served before `assertRelaySeeded()` deadlines.
+5. **Composite keyset paging fidelity** — `(created_at, event_id)` with correct
+   same-second tiebreak (id ASC forward-walk), or `parity-ancestor-island` and
+   the perf scrollback break. The client trusts the relay's ordering exactly.
+
+No spec hardcodes Block-relay-only behaviour that a conforming Nostr+bridge
+cannot satisfy: everything routes through `X-Pubkey` + `/query` + `/events` +
+WS NIP-42. The coupling is to the **Buzz query dialect** (window read-model,
+thread_metadata, keyset), not to Block infrastructure.
+
+codex
+The key tension is now clear: the high-level architecture is compatible with the four-spec topology, but several normative read/ingest details are only named, not made implementable by the schema or work-package boundaries. I’m checking the fixture expectations and spike reuse claims next so the blocking findings distinguish real contract gaps from harmless M1b deferrals.
+exec
+/bin/zsh -lc "sed -n '1,280p' m1a-recon/thread-fixtures.json; sed -n '1,220p' m1a-recon/spike.md" in /private/tmp/claude-501/-Users-davidirvine-Desktop-Devel-projects-x0x/bd2e18ed-68f8-4883-bb4f-30b27b6c2ae1/scratchpad
+ succeeded in 0ms:
+{
+  "$comment": "Conformance vectors for Buzz thread_metadata, mined from block/buzz @ 710ed9ff (v0.4.24). Sources: crates/buzz-test-client/tests/e2e_nostr_interop.rs and crates/buzz-db/src/thread.rs #[cfg(test)]. IDs are symbolic placeholders (ROOT, R1, ...) — a driver substitutes real 32-byte event ids and channel uuids. Tag form is NIP-10 marked: [\"e\", <id>, <relay-hint>, <marker>]. 'kind' 9 = KIND_STREAM_MESSAGE. Every input event also carries an [\"h\", CHANNEL] tag (omitted from tags[] for brevity unless load-bearing) and is signed by the noted author. Expected outputs describe the thread_metadata row(s), counter deltas, ingest verdict, and any 39005 emit.",
+  "constants": {
+    "KIND_STREAM_MESSAGE": 9,
+    "KIND_THREAD_SUMMARY": 39005,
+    "KIND_WINDOW_BOUNDS": 39006,
+    "DEPTH_CAP": 100,
+    "PARTICIPANT_CAP": 10,
+    "partition_key": ["community_id", "event_created_at", "event_id"],
+    "top_level_predicate": "depth IS NULL OR depth = 0 OR (depth = 1 AND broadcast = true)",
+    "summary_content_shape": {"reply_count": "i32", "descendant_count": "i32", "last_reply_at": "unix_seconds|null", "participants": ["hex_pubkey"]},
+    "summary_tags": [["e", "<root_hex>"], ["d", "<root_hex>"], ["h", "<channel>"]]
+  },
+  "vectors": [
+    {
+      "id": "V1_simple_reply_to_root",
+      "source": "e2e_nostr_interop.rs::test_nip10_thread_reply_creates_metadata (L437-499)",
+      "covers": "reply-only marker (no root marker) => parent==root, depth 1",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root message", "tags": [], "note": "top-level; NO thread_metadata row created on insert"},
+        {"label": "R1", "author": "A", "kind": 9, "content": "reply to root", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "root_verdict": "accepted (top-level, depth=NULL, no metadata row)",
+        "R1_verdict": "accepted",
+        "R1_metadata": {"event_id": "R1", "parent_event_id": "ROOT", "root_event_id": "ROOT", "depth": 1, "broadcast": false},
+        "counters_after": {"ROOT_stub": {"reply_count": 1, "descendant_count": 1, "last_reply_at": "NOW()"}},
+        "get_thread_replies(ROOT)": ["R1"],
+        "root_not_in_thread_replies": true,
+        "emit_39005": {"e": "ROOT", "d": "ROOT", "reply_count": 1, "descendant_count": 1}
+      }
+    },
+    {
+      "id": "V2_reply_with_both_markers",
+      "source": "resolve_nip10_thread_meta L592-596, L630-651",
+      "covers": "root+reply markers, nested depth-2 via metadata branch",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "content": "child", "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "R2", "author": "C", "kind": 9, "content": "grandchild", "tags": [["e", "ROOT", "", "root"], ["e", "R1", "", "reply"]]}
+      ],
+      "expected": {
+        "R2_metadata": {"parent_event_id": "R1", "root_event_id": "ROOT", "depth": 2, "broadcast": false},
+        "counters_after": {"ROOT": {"reply_count": 1, "descendant_count": 2}, "R1_stub": {"reply_count": 1, "descendant_count": "n/a (not a root)"}},
+        "note": "descendant_count on ROOT counts BOTH R1 and R2; reply_count on ROOT counts only its DIRECT child R1; R1.reply_count counts its direct child R2.",
+        "emit_39005_for_ROOT": {"reply_count": 1, "descendant_count": 2, "participants_contains": ["B", "C"]}
+      }
+    },
+    {
+      "id": "V3_orphan_reply_unknown_parent_rejected",
+      "source": "e2e_nostr_interop.rs::test_nip10_unknown_parent_rejected (L502-529); ingest L608-610",
+      "covers": "parent-must-exist-at-ingest; out-of-order arrival",
+      "inputs": [
+        {"label": "R1", "author": "A", "kind": 9, "content": "orphan reply", "tags": [["e", "FAKE_PARENT_NEVER_STORED", "", "reply"]]}
+      ],
+      "expected": {
+        "R1_verdict": "REJECTED",
+        "ok_accepted": false,
+        "message_contains": "reply parent not found",
+        "stored_flat": false,
+        "gossip_note": "This is the rule an eventually-consistent backend CANNOT keep as-is: a reply may legitimately arrive before its parent. Bridge v2 must park+backfill, not reject."
+      }
+    },
+    {
+      "id": "V4_root_mismatch_rejected",
+      "source": "e2e_nostr_interop.rs::test_nip10_root_mismatch_rejected (L540-580); ingest L677-679",
+      "covers": "server-verified ancestry; client root must equal derived root",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "real root", "tags": []},
+        {"label": "R1_bad", "author": "A", "kind": 9, "content": "reply with wrong root", "tags": [["e", "WRONG_ROOT_0xab..", "", "root"], ["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "R1_bad_verdict": "REJECTED",
+        "ok_accepted": false,
+        "message_contains": "root tag does not match",
+        "reason": "parent ROOT has no metadata row => derived root defaults to ROOT itself; client claimed WRONG_ROOT => mismatch"
+      }
+    },
+    {
+      "id": "V5_only_root_marker_is_top_level",
+      "source": "resolve_nip10_thread_meta L592-596 (Some(_),None) arm",
+      "covers": "SUBTLE: only a root marker, no reply marker => NOT a reply",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "tags only root marker", "tags": [["e", "ROOT", "", "root"]]}
+      ],
+      "expected": {
+        "E1_verdict": "accepted",
+        "E1_metadata": null,
+        "E1_is_top_level": true,
+        "E1_depth": "NULL",
+        "counters_touched": "none (ROOT.reply_count stays 0)",
+        "note": "A naive reimplementation would treat root-only as a reply-to-root. Buzz does NOT."
+      }
+    },
+    {
+      "id": "V6_positional_etag_ignored",
+      "source": "resolve_nip10_thread_meta L573-589 (requires parts.len()>=4 marker)",
+      "covers": "positional/unmarked NIP-10 e-tag is ignored, stored flat (not rejected)",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "positional reply", "tags": [["e", "ROOT"]]}
+      ],
+      "expected": {
+        "E1_verdict": "accepted",
+        "E1_metadata": null,
+        "E1_is_top_level": true,
+        "note": "Buzz does not implement NIP-10 positional convention. Bare/unmarked e-tags never create thread ancestry and are never rejected — they become ordinary top-level messages."
+      }
+    },
+    {
+      "id": "V7_mention_marker_ignored",
+      "source": "resolve_nip10_thread_meta L579-583 (only root|reply matched)",
+      "covers": "marker 'mention' ignored",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root", "tags": []},
+        {"label": "E1", "author": "B", "kind": 9, "content": "mentions root", "tags": [["e", "ROOT", "", "mention"]]}
+      ],
+      "expected": {"E1_verdict": "accepted", "E1_metadata": null, "E1_is_top_level": true}
+    },
+    {
+      "id": "V8_broadcast_depth1_surfaced_vs_hidden",
+      "source": "e2e_nostr_interop.rs::test_nip10_thread_reply_not_in_top_level (L862-961); thread.rs top-level predicate L597-600",
+      "covers": "broadcast flag gates a depth-1 reply into the channel window",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "root-toplevel", "tags": []},
+        {"label": "R_hidden", "author": "A", "kind": 9, "content": "reply-excluded", "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "R_shown", "author": "A", "kind": 9, "content": "reply-broadcast", "tags": [["e", "ROOT", "", "reply"], ["broadcast", "1"]]}
+      ],
+      "expected": {
+        "both_recorded_under_root": ["R_hidden", "R_shown"],
+        "R_hidden_metadata": {"depth": 1, "broadcast": false},
+        "R_shown_metadata": {"depth": 1, "broadcast": true},
+        "channel_window_rows_contains": ["ROOT", "R_shown"],
+        "channel_window_rows_excludes": ["R_hidden"],
+        "rule": "depth=1 reply is a top-level row IFF broadcast=true"
+      }
+    },
+    {
+      "id": "V9_channel_window_summary_overlay",
+      "source": "e2e_nostr_interop.rs::test_channel_window_rows_overlays_and_exact_multiple_exhaustion (L1770-1852); bridge.rs L534-556",
+      "covers": "include_summaries emits relay-signed 39005 for rows with replies; reply is never a row",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "content": "windowed root", "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "content": "window reply", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "query": {"endpoint": "POST /query (channel window)", "extensions": {"include_summaries": true}},
+      "expected": {
+        "rows_contains": ["ROOT"],
+        "rows_excludes": ["R1"],
+        "overlay_39005": {"kind": 39005, "signed_by": "relay_keypair (NOT requester)", "tags_contain": [["e", "ROOT"], ["d", "ROOT"], ["h", "CHANNEL"]], "content.reply_count": 1},
+        "overlay_39006_window_bounds": {"kind": 39006, "count_per_response": 1},
+        "rows_without_replies_get_no_39005": true
+      }
+    },
+    {
+      "id": "V10_client_overlay_kinds_rejected",
+      "source": "e2e_nostr_interop.rs::test_channel_window_rejects_half_cursor_and_client_overlay_kinds (L1918-1980)",
+      "covers": "39005/39006 are relay-authored only; client submissions rejected at ingest",
+      "inputs": [
+        {"label": "spoof_summary", "author": "A", "kind": 39005, "content": "{\"reply_count\":999}", "tags": [["e", "ROOT", "", ""], ["d", "ROOT"], ["h", "CHANNEL"]]},
+        {"label": "spoof_bounds", "author": "A", "kind": 39006, "content": "{}", "tags": [["h", "CHANNEL"]]}
+      ],
+      "expected": {"spoof_summary_verdict": "REJECTED", "spoof_bounds_verdict": "REJECTED"}
+    },
+    {
+      "id": "V11_deep_nesting_at_cap",
+      "source": "resolve_nip10_thread_meta L646-649 (depth>100 => Err)",
+      "covers": "depth cap 100: level 100 accepted, level 101 rejected",
+      "inputs": [
+        {"label": "chain", "note": "root R0 (depth NULL) then R1..R100 each replying to the previous with markers [\"e\",ROOT,\"\",\"root\"],[\"e\",R{n-1},\"\",\"reply\"]. R_k has depth k."},
+        {"label": "R100", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "R99", "", "reply"]]},
+        {"label": "R101", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "R100", "", "reply"]]}
+      ],
+      "expected": {
+        "R100_verdict": "accepted", "R100_depth": 100,
+        "R101_verdict": "REJECTED", "R101_message_contains": "thread depth limit exceeded",
+        "counters": "ROOT.descendant_count == 100 after full chain (each level bumps root once); ROOT.reply_count == 1 (only R1 is a direct child)"
+      }
+    },
+    {
+      "id": "V12_cross_channel_parent_rejected",
+      "source": "resolve_nip10_thread_meta L612-616",
+      "covers": "reply whose parent lives in a different channel is rejected",
+      "inputs": [
+        {"label": "root_chanA", "author": "A", "kind": 9, "content": "root in channel A", "channel": "CH_A", "tags": []},
+        {"label": "R1", "author": "A", "kind": 9, "content": "reply from channel B", "channel": "CH_B", "tags": [["e", "ROOT_CHAN_A", "", "reply"]]}
+      ],
+      "expected": {"R1_verdict": "REJECTED", "message_contains": "parent event belongs to a different channel"}
+    },
+    {
+      "id": "V13_nested_reply_before_root_stub",
+      "source": "thread.rs::insert_thread_metadata_nested_reply_creates_root_stub (L1276-1340) + get_thread_replies_reaches_nested_depth_two_replies (L1181-1275)",
+      "covers": "depth-2 grandchild where root!=parent creates the root stub row lazily; subtree read reaches it",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "child", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "grandchild", "author": "A", "kind": 9, "tags": [["e", "ROOT", "", "root"], ["e", "CHILD", "", "reply"]]}
+      ],
+      "expected": {
+        "grandchild_metadata": {"parent_event_id": "CHILD", "root_event_id": "ROOT", "depth": 2},
+        "get_thread_replies(ROOT, depth_limit=64)_contains": ["child", "grandchild"],
+        "subtree_read_must_not_stop_at_depth_1": true,
+        "note": "exercises the root_id != parent_id stub-INSERT branch (thread.rs L182-205)"
+      }
+    },
+    {
+      "id": "V14_same_second_tie_pagination",
+      "source": "thread.rs::get_thread_replies_pages_same_second_ties_without_loss (L1057-1166)",
+      "covers": "keyset cursor is (event_created_at, event_id) composite — same-second ties must not be dropped across pages",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "R1..R5", "author": "A", "kind": 9, "created_at": "ALL == root.created_at + 1 (identical second)", "tags": [["e", "ROOT", "", "reply"]]}
+      ],
+      "expected": {
+        "paginate_limit_2": "pages walk (created_at, id) tuples > cursor, not created_at alone",
+        "total_collected": 5,
+        "duplicates": 0,
+        "loss": 0,
+        "note": "a timestamp-only cursor would silently drop tied replies past the first page limit"
+      }
+    },
+    {
+      "id": "V15_delete_reply_decrements_counters",
+      "source": "thread.rs::decrement_reply_count (L292-322) + get_thread_metadata_by_event (L755-810)",
+      "covers": "soft-delete of a reply mirrors the increment: parent.reply_count-1 and root.descendant_count-1, floored at 0; late 39005 recompute",
+      "inputs": [
+        {"label": "root", "author": "A", "kind": 9, "tags": []},
+        {"label": "R1", "author": "B", "kind": 9, "tags": [["e", "ROOT", "", "reply"]]},
+        {"label": "delete_R1", "author": "B", "kind": "5 (NIP-09) or 9005 (NIP-29 delete-event)", "tags": [["e", "R1"]]}
+      ],
+      "expected": {
+        "counters_after_reply": {"ROOT": {"reply_count": 1, "descendant_count": 1}},
+        "counters_after_delete": {"ROOT": {"reply_count": 0, "descendant_count": 0}},
+        "floor": "GREATEST(x-1, 0) — never negative even on duplicate delete",
+        "emit_39005_after_delete": {"reply_count": 0, "descendant_count": 0},
+        "note": "if the ROOT row was itself deleted, get_thread_summary returns None and emit_live_thread_summary silently no-ops (side_effects L739-741)"
+      }
+    }
+  ]
+}
+# M1a recon: x0x-nostr-bridge spike vs bridge-v2 M1a surface
+
+Read-only audit, 2026-07-24. Source: `/Users/davidirvine/Desktop/Devel/projects/x0x/x0x-nostr-bridge/`
+(src 4.7 KLOC across 7 files; 40 unit + 8 integration test fns). Nothing modified.
+
+**One-line finding:** the spike is a **WS-only, generic-Nostr relay facade** with a
+flat generic-Nostr SQLite schema. M1a rows 1–2 are essentially done; rows 3–8 (the
+Buzz **HTTP** dialect + server-side thread machinery) are absent, and the store schema
+does not anticipate keyset cursors, thread_metadata, or summaries. The single HTTP
+route on the whole bridge is `/` (WS upgrade, or NIP-11 doc on `Accept: application/nostr+json`).
+
+---
+
+## 1. Coverage matrix
+
+| # | M1a surface | Status | Evidence | What exists |
+|---|---|---|---|---|
+| 1 | Nostr WS dialect (REQ/EVENT/EOSE/CLOSE + NIP-29) | **COVERED** | `relay.rs:296-342` dispatch; EOSE `relay.rs:490`; CLOSE→unregister `relay.rs:331`; NIP-29 `#h`→topic `proto.rs:29-58` | Full AUTH/EVENT/REQ/CLOSE + OK/NOTICE/CLOSED/EOSE. COUNT/NEG answered `"unsupported"`. NIP-29 group id = `#h` tag mapped to a per-channel gossip topic. |
+| 2 | NIP-42 AUTH over WS (+ relay-tag validation) | **PARTIAL** | challenge on connect `relay.rs:259`; verify `proto.rs:91`; relay-tag skip `proto.rs:89-90` | uuid challenge, single-use, asymmetric time window (`AUTH_MAX_AGE_SECS=600`, future skew 60). **`relay` tag NOT checked** — the exact gap row 2 names; documented spike limitation. |
+| 3 | `POST /events` HTTP ingest | **MISSING** | only route is `/` `relay.rs:192`; no axum POST route | Ingest today is WS `EVENT` (`handle_event` `relay.rs:346`) + gossip inbox (`ingest.rs:21`). No HTTP ingest endpoint at all. |
+| 4 | `POST /query` + Buzz ext (top_level, include_summaries, include_aux, keyset cursor) | **MISSING** | no HTTP query route; `store.rs:281` query is Nostr-filter only | Read path is WS `REQ`→`store.query()`. Zero support for the four extensions. Ordering is `created_at DESC, id ASC LIMIT` (`store.rs:374`) — no keyset WHERE, no scope/community column. |
+| 5 | NIP-50 search via `/query` | **PARTIAL** | FTS5 `store.rs:107-122`, `fts_match_expr` `store.rs:446`, applied `store.rs:325-338` | Search **engine** works (sanitized FTS5 MATCH over `content`) but only via WS `REQ filter.search`. No HTTP `/query` to route it through. |
+| 6 | `thread_metadata` at ingest | **MISSING** | grep: 0 hits anywhere | No parent-exists check, no ancestry walk, no depth cap, no counters, no `(community,created_at,id)` partition keys. Insert path is fire-and-forget, no FK/ancestry (`store.rs:143-164`). |
+| 7 | `GET /info` membership gate | **MISSING** | no `/info` route | No membership concept in the bridge. Only NIP-11 doc served at `/` (`relay.rs:225`). |
+| 8 | Live thread-summary emits (post-commit, fan-out kind) | **MISSING** | live dispatch `relay.rs:131` exists, no summary logic | `hub.dispatch` fans live events to matching REQ subs, but no post-commit summary recompute and no fan-out summary kind. |
+
+**Cross-cutting**
+
+| Item | Status | Evidence |
+|---|---|---|
+| HTTP 429 rate-limit | **MISSING** | 0 grep hits; no HTTP surface to rate-limit yet |
+| 1012 restart-close on shutdown | **MISSING** | 0 hits; disconnect just breaks the read loop (`relay.rs:269`), no graceful 1012 |
+| Connection cap | **PARTIAL** | per-conn **sub** cap `MAX_SUBS_PER_CONN=1024` (`relay.rs:96`); **global connection cap absent** (the fork-plan review fix) |
+| Per-topic mutex pruning | **PARTIAL** | per-topic forwarder mgmt in transport (DashMap `topics`/`inflight`, one forwarder/topic, DELETE+re-POST on reconnect, race-free `ensure_topic`) — related, not the exact "mutex prune" item |
+
+---
+
+## 2. Architecture map
+
+**Modules**
+- `proto.rs` (181, **FROZEN** — header says "Do not edit"): the Nostr contract. Topic
+  mapping `buzz.v1.global` + `buzz.v1.ch.<channel>` from `#h` tags; kind classes
+  (NIP-16); NIP-01 verify + NIP-42 auth verify; limits (64 KiB frame, 1024 subs/conn,
+  500 filter limit).
+- `relay.rs` (892): axum server. `router()` = **one route** `/`. `root_handler`
+  branches WS-upgrade vs NIP-11 doc vs `426 UPGRADE_REQUIRED`. Per-conn task issues
+  AUTH challenge, runs read loop through gates: AUTH→EVENT (verify, store.insert,
+  publish to topics)→REQ (auth-gate, sanitize filters, register sub, backfill from
+  SQLite, EOSE)→CLOSE. `Hub` holds subscriptions and does live `dispatch`.
+- `store.rs` (955): SQLite. **Schema = flat `events(id,pubkey,created_at,kind,tags
+  JSON,content,sig,raw)`** + `replaceable_addrs(pubkey,kind,d_tag→event_id)` +
+  `events_fts` (FTS5 on content, trigger-synced). Indexes: kind, pubkey, created_at.
+  No thread/summary/scope columns. Query builds parameterized WHERE from a Nostr
+  `Filter`, `ORDER BY created_at DESC, id ASC LIMIT`. Replaceable/parameterized-
+  replaceable resolution, `#h` case-insensitive.
+- `transport.rs` (892): the x0xd client. `X0xTransport::connect` (GET /health) +
+  SSE supervisor. Consumes gossip via POST /subscribe, DELETE /subscribe/:id,
+  POST /publish, GET /events (SSE). Reconnect = DELETE+re-POST all topics
+  (leak-free). Routes seen at 735-836 are `#[cfg(test)]` **mock daemon** servers,
+  not bridge routes.
+- `ingest.rs` (65): `ingest_one` — gossip inbox message → verify → store → dispatch.
+- `config.rs` (44), `main.rs` (84): API discovery / wiring / loopback bind.
+
+**WS session model:** subscription = (ConnId, sub_id, filters) in `Hub`. REQ registers
+first (so live events interleave), then backfills from SQLite per filter, then EOSE.
+Backfill-from-SQLite path = `store.query()`. No cross-bridge history catch-up (a bridge
+only sees events gossiped while running + its own DB — documented limitation).
+
+**Auth model:** NIP-42 proof-of-key only; every EVENT/REQ requires prior AUTH on the
+connection. Explicitly "not access control" and loopback-only. No membership/ACL.
+
+**Shutdown path:** none graceful. Read loop breaks on `Message::Close`/error, drops tx,
+unregisters conn, awaits writer. A 1012 restart-close would hook into `handle_connection`
+(`relay.rs:242-277`) with a shared shutdown signal driving the writer to emit a close frame.
+
+---
+
+## 3. Reuse verdict per M1a row
+
+| # | Verdict | Seam it bolts onto |
+|---|---|---|
+| 1 | **extend-in-place** | `relay.rs:handle_text` dispatch — dialect done; only NIP-29 nuance work if any |
+| 2 | **extend-in-place** | `proto.rs:verify_auth_event` — add expected relay-URL param + check |
+| 3 | **build-new** | new `POST /events` route in `relay.rs:router()`; reuse `handle_event`/`store.insert`/`publish_to_topics` for the body |
+| 4 | **extend-with-refactor** | `store.rs:migrate()` + `query()` (add scope/thread cols, keyset cursor WHERE) **and** new `POST /query` route; this is the schema-touching one |
+| 5 | **extend-in-place** | route NIP-50 through the new `/query`; `store.rs:fts_match_expr` reused as-is |
+| 6 | **build-new** | ingest path (`handle_event` + `ingest.rs`) + `store` insert transaction + `migrate()` — ancestry walk, counters, partition keys |
+| 7 | **build-new** | `router()` + a membership provider (from x0xd groups or bridge config) |
+| 8 | **build-new** | post-insert hook in `handle_event` → recompute → `hub.dispatch` a fan-out summary kind |
+
+**Design decisions that actively FIGHT M1a:**
+1. **`proto.rs` is frozen and deliberately generic-Nostr.** Rows 4/6/8 need Buzz-specific
+   per-kind logic and new limits/kinds; the frozen contract must be unfrozen and extended.
+2. **Flat `events` schema with no scope/community/thread columns and `ORDER BY
+   created_at DESC, id ASC`** — keyset-cursor pagination (row 4) is a schema+index+query
+   **redesign**, not a parameter add. The fork plan's `(community_id, event_created_at,
+   event_id)` partition key does not exist.
+3. **Fire-and-forget, no-FK insert** (`store.rs:143`) fights `thread_metadata`'s
+   "parent-must-exist-at-ingest + transactional counters + server-verified ancestry"
+   (row 6). Ingest must become a real transaction that reads ancestry and updates counters.
+4. **WS-only surface.** Rows 3/4/5/7 are all HTTP; the bridge has no HTTP router beyond
+   `/`. Adding them is additive (axum makes this cheap) but it is genuinely new surface,
+   not a tweak.
+
+---
+
+## 4. x0xd API dependencies
+
+Everything the spike consumes is **released in x0x 0.34.x** (`docs/api-reference.md`):
+
+| x0xd endpoint (spike use) | api-reference | Notes |
+|---|---|---|
+| `GET /health` | line 42 | liveness on connect (`transport.rs:218`) |
+| `POST /subscribe {topic}→{subscription_id}` | line 229 | per-topic forwarder (`transport.rs:149`) |
+| `DELETE /subscribe/:id` | line 230 | teardown, 404-tolerant (`transport.rs:178`) |
+| `POST /publish` (base64 payload) | line 228 | event fan-out to gossip (`transport.rs:281`) |
+| `GET /events` (SSE `{type:"message",data:{topic,payload}}`) | line 231 + shape at 242 | inbox feed (`transport.rs:362`) |
+
+Auth = `Authorization: Bearer <token>` (`transport.rs:205`); base URL + token discovered
+from `~/.x0x` or `X0X_API`/`X0X_TOKEN` env.
+
+**No unreleased x0xd dependency for M1a.** The spike uses its **own SQLite**, not
+`/history/*`. `/history/*` (ADR-0023) does **not** exist in the API reference — and M1a
+does not need it: thread_metadata is computed **in-bridge** for M1a. ADR-0023 history +
+thread columns are a **Stage-3** concern (move thread_metadata server-side into x0xd), not
+an M1a ask.
+
+**Future x0xd ask (Stage 3, not M1a):** if/when thread_metadata + search move server-side,
+x0xd needs the ADR-0023 history store with thread columns + a `/history/search` endpoint.
+
+codex
+The architecture is fundamentally compatible with M1a: one bridge, one SQLite writer, multiple Buzz clients, and bridge-local thread computation satisfy the four-spec topology. The design needs several contract details tightened before implementation; none requires abandoning D1–D6.
+
+### Soundness
+
+**Single-community collapse.** Dropping `community_id` is safe while one process is permanently bound to one community. Nostr event IDs are globally content-derived, so `event_id` can replace the larger partition key for point updates. `channel_id` still must constrain window, thread, membership, parent-validation, aux, and summary queries.
+
+Cursor behavior remains correct only if IDs are canonical lowercase hex (or 32-byte BLOBs) under binary ordering. For the window order `created_at DESC, id ASC`, the next-page predicate must be:
+
+```sql
+created_at < :cursor_ts
+OR (created_at = :cursor_ts AND id > :cursor_id)
+```
+
+For thread order `event_created_at ASC, event_id ASC`, it must be:
+
+```sql
+event_created_at > :cursor_ts
+OR (event_created_at = :cursor_ts AND event_id > :cursor_id)
+```
+
+The collapse becomes unsafe if a database is later reused for another community, a bridge changes community without clearing/migrating it, or queries omit `channel_id`. That boundary should be enforced in configuration and migration metadata.
+
+**Two-door ingest.** Parking is safe only when a parked event is completely invisible: it cannot enter `events`, FTS, counters, HTTP results, WS fan-out, or mesh republishing until ancestry validation succeeds. Attachment must be atomic and recursively resolve pending descendants, regardless of whether the missing parent arrives through the local or mesh door.
+
+A late mesh event can land behind a cursor already consumed by the client. No stateless `(created_at,id)` cursor—including Buzz’s reference implementation—provides snapshot isolation against arbitrary backdated concurrent inserts. M1a’s parity gate avoids that condition by seeding before paging. Ordinary replies do not alter the top-level row budget; only a late broadcast depth-1 reply can insert a window row. This limitation should be documented rather than misrepresented as a cursor guarantee.
+
+**Deferred convergence.** None of the four specs depends on cross-bridge metadata convergence:
+
+- `integration.spec.ts` uses two users connected to the same bridge.
+- `stream.spec.ts` tests local WS fan-out between two contexts on that bridge.
+- `dm-double-notification.spec.ts` uses the pre-seeded deterministic DM channel on that bridge.
+- `parity-ancestor-island.spec.ts` pages one SQLite history.
+
+The two-relay live gate is explicitly outside M1a. D1 is therefore sound for this milestone.
+
+### Gate coverage
+
+`integration.spec.ts` does not rely on thread metadata for mentions. It relies on generic Nostr tag filtering and live subscription matching. HTTP `/query` and WS `REQ` must both implement `#p` matching and identical channel/access restrictions; WP2’s authorization language alone does not explicitly guarantee that query and live-match parity.
+
+For `stream.spec.ts`, post-commit fan-out gives the correct visibility boundary. A 39005 arriving before a refetch is harmless because it is computed after commit and summaries do not consume the row budget. The implementation should not cache assembled windows across commits unless cache invalidation covers raw rows, aux closure, summaries, and bounds.
+
+WP4 explicitly pre-seeds the UUIDv5 DM channel, so simultaneous first-creation is not exercised. If dynamic creation is later added, it needs a unique canonical participant-pair key and an atomic insert/upsert; UUIDv5 alone makes the ID deterministic but does not serialize associated membership setup.
+
+The parity spec and V14 require the exact directional predicates above in both paths. Merely declaring composite indexes does not establish correct pagination. Window exhaustion also requires a `limit + 1` probe so an exact-multiple final page produces `has_more:false`.
+
+WP1-first is reasonable, but the smallest complete vertical slice should include schema, transactional ingest, exact keyset SQL, 39006 generation, and fixture tests. Orphan resolution and read-model SQL are part of that critical path, not cleanup for WP5.
+
+### Findings
+
+1. **BLOCKING — The mesh orphan lifecycle violates the two-door served-state invariant because `pending_orphans` is defined but quarantine state, recursive attachment, and visibility boundaries are not.** Pending and quarantined events must remain outside `events`, FTS, counters, reads, and fan-out; attachment must atomically validate ancestry, insert, update counters, and drain descendants when a parent arrives through either door.
+
+2. **BLOCKING — WP2’s pagination description violates the composite cursor contract because it specifies indexes and cursor fields without specifying the directional `WHERE` clauses or the `limit + 1` exhaustion probe.** Window paging needs timestamp-descending/id-ascending comparison, thread paging needs ascending tuple comparison, and 39006 must determine exact-multiple exhaustion.
+
+3. **BLOCKING — WP2/WP3 violate HTTP/WS filter parity required by `integration.spec.ts` because they do not explicitly make standard tag matching—especially `#p` mention/DM matching—and access filtering common to historical queries and live subscriptions.** Mention refetch can work without thread metadata, but only if stored-query and live-dispatch matching use the same filter semantics.
+
+4. **BLOCKING — The window read-model description violates the normative `include_aux` contract because “reaction/deletion/edit closure” does not define the required deletion-of-aux second hop.** The implementation and tests must cover reactions, deletions, edits, and deletions targeting those auxiliary events without charging them against the row budget.
+
+5. **BLOCKING — WP1’s participant derivation violates the 39005 payload contract because it states only “derived at read, cap 10” and omits `DISTINCT pubkey ORDER BY MAX(created_at) DESC`.** The selection and ordering must be explicit; the current indexes are adequate for correctness but may warrant profiling.
+
+6. **BLOCKING — The delete path violates V15 unless counter decrement and a post-commit 39005 recomputation are one defined workflow.** WP1 mentions decrements and WP3 mentions live summaries separately; the design must explicitly emit the updated zero-or-reduced summary after a successful deletion commit and suppress duplicate-delete decrements.
+
+7. **ADVISORY — The single-community schema risks accidental scope reuse because the community identity exists only as a process assumption.** Persist a database-level community identifier or fingerprint and refuse startup when configuration selects a different community; continue constraining all thread and aux queries by `channel_id`.
+
+8. **ADVISORY — Text event IDs risk cursor-order divergence because canonicalization and SQLite collation are unspecified.** Store lowercase 64-hex IDs with binary collation or use 32-byte BLOBs, and reject/noncanonically normalize cursor IDs before comparison.
+
+9. **ADVISORY — D5 expands M1a’s critical path beyond the four-spec gate because config-mode exercises only `X-Pubkey`.** Full fail-closed NIP-98 is appropriate for a complete production-dialect claim, but it can follow the four-spec vertical slice if schedule pressure arises; its replay cache must be scoped to the one community and method/URL checks must use the actual tenant URL.
+
+10. **ADVISORY — Treating 1012 shutdown as a stretch falls short of the full dialect contract, although it does not violate the four-spec M1a gate.** It may move to M1b because `relay-restart.live.spec.ts` is skipped, but the release should then be described as gate-conformant rather than fully restart-conformant.
+
+11. **ADVISORY — Empty presence results satisfy the documented M1a gate because none of the four specs queries presence-only filters.** The bridge should detect those filters and return an empty array explicitly, avoiding accidental SQLite treatment that could later expose persisted presence events.
+
+12. **ADVISORY — D4 inaccurately says the relay keypair “signs NIP-11” because a NIP-11 document is not itself a signed Nostr event.** The persisted key supplies the NIP-11 `self` value and signs 39005, 39006, 13534, and other relay-authored events.
+
+VERDICT: SOUND-WITH-CHANGES
+hook: Stop
+hook: Stop Completed
+tokens used
+55,884
+The architecture is fundamentally compatible with M1a: one bridge, one SQLite writer, multiple Buzz clients, and bridge-local thread computation satisfy the four-spec topology. The design needs several contract details tightened before implementation; none requires abandoning D1–D6.
+
+### Soundness
+
+**Single-community collapse.** Dropping `community_id` is safe while one process is permanently bound to one community. Nostr event IDs are globally content-derived, so `event_id` can replace the larger partition key for point updates. `channel_id` still must constrain window, thread, membership, parent-validation, aux, and summary queries.
+
+Cursor behavior remains correct only if IDs are canonical lowercase hex (or 32-byte BLOBs) under binary ordering. For the window order `created_at DESC, id ASC`, the next-page predicate must be:
+
+```sql
+created_at < :cursor_ts
+OR (created_at = :cursor_ts AND id > :cursor_id)
+```
+
+For thread order `event_created_at ASC, event_id ASC`, it must be:
+
+```sql
+event_created_at > :cursor_ts
+OR (event_created_at = :cursor_ts AND event_id > :cursor_id)
+```
+
+The collapse becomes unsafe if a database is later reused for another community, a bridge changes community without clearing/migrating it, or queries omit `channel_id`. That boundary should be enforced in configuration and migration metadata.
+
+**Two-door ingest.** Parking is safe only when a parked event is completely invisible: it cannot enter `events`, FTS, counters, HTTP results, WS fan-out, or mesh republishing until ancestry validation succeeds. Attachment must be atomic and recursively resolve pending descendants, regardless of whether the missing parent arrives through the local or mesh door.
+
+A late mesh event can land behind a cursor already consumed by the client. No stateless `(created_at,id)` cursor—including Buzz’s reference implementation—provides snapshot isolation against arbitrary backdated concurrent inserts. M1a’s parity gate avoids that condition by seeding before paging. Ordinary replies do not alter the top-level row budget; only a late broadcast depth-1 reply can insert a window row. This limitation should be documented rather than misrepresented as a cursor guarantee.
+
+**Deferred convergence.** None of the four specs depends on cross-bridge metadata convergence:
+
+- `integration.spec.ts` uses two users connected to the same bridge.
+- `stream.spec.ts` tests local WS fan-out between two contexts on that bridge.
+- `dm-double-notification.spec.ts` uses the pre-seeded deterministic DM channel on that bridge.
+- `parity-ancestor-island.spec.ts` pages one SQLite history.
+
+The two-relay live gate is explicitly outside M1a. D1 is therefore sound for this milestone.
+
+### Gate coverage
+
+`integration.spec.ts` does not rely on thread metadata for mentions. It relies on generic Nostr tag filtering and live subscription matching. HTTP `/query` and WS `REQ` must both implement `#p` matching and identical channel/access restrictions; WP2’s authorization language alone does not explicitly guarantee that query and live-match parity.
+
+For `stream.spec.ts`, post-commit fan-out gives the correct visibility boundary. A 39005 arriving before a refetch is harmless because it is computed after commit and summaries do not consume the row budget. The implementation should not cache assembled windows across commits unless cache invalidation covers raw rows, aux closure, summaries, and bounds.
+
+WP4 explicitly pre-seeds the UUIDv5 DM channel, so simultaneous first-creation is not exercised. If dynamic creation is later added, it needs a unique canonical participant-pair key and an atomic insert/upsert; UUIDv5 alone makes the ID deterministic but does not serialize associated membership setup.
+
+The parity spec and V14 require the exact directional predicates above in both paths. Merely declaring composite indexes does not establish correct pagination. Window exhaustion also requires a `limit + 1` probe so an exact-multiple final page produces `has_more:false`.
+
+WP1-first is reasonable, but the smallest complete vertical slice should include schema, transactional ingest, exact keyset SQL, 39006 generation, and fixture tests. Orphan resolution and read-model SQL are part of that critical path, not cleanup for WP5.
+
+### Findings
+
+1. **BLOCKING — The mesh orphan lifecycle violates the two-door served-state invariant because `pending_orphans` is defined but quarantine state, recursive attachment, and visibility boundaries are not.** Pending and quarantined events must remain outside `events`, FTS, counters, reads, and fan-out; attachment must atomically validate ancestry, insert, update counters, and drain descendants when a parent arrives through either door.
+
+2. **BLOCKING — WP2’s pagination description violates the composite cursor contract because it specifies indexes and cursor fields without specifying the directional `WHERE` clauses or the `limit + 1` exhaustion probe.** Window paging needs timestamp-descending/id-ascending comparison, thread paging needs ascending tuple comparison, and 39006 must determine exact-multiple exhaustion.
+
+3. **BLOCKING — WP2/WP3 violate HTTP/WS filter parity required by `integration.spec.ts` because they do not explicitly make standard tag matching—especially `#p` mention/DM matching—and access filtering common to historical queries and live subscriptions.** Mention refetch can work without thread metadata, but only if stored-query and live-dispatch matching use the same filter semantics.
+
+4. **BLOCKING — The window read-model description violates the normative `include_aux` contract because “reaction/deletion/edit closure” does not define the required deletion-of-aux second hop.** The implementation and tests must cover reactions, deletions, edits, and deletions targeting those auxiliary events without charging them against the row budget.
+
+5. **BLOCKING — WP1’s participant derivation violates the 39005 payload contract because it states only “derived at read, cap 10” and omits `DISTINCT pubkey ORDER BY MAX(created_at) DESC`.** The selection and ordering must be explicit; the current indexes are adequate for correctness but may warrant profiling.
+
+6. **BLOCKING — The delete path violates V15 unless counter decrement and a post-commit 39005 recomputation are one defined workflow.** WP1 mentions decrements and WP3 mentions live summaries separately; the design must explicitly emit the updated zero-or-reduced summary after a successful deletion commit and suppress duplicate-delete decrements.
+
+7. **ADVISORY — The single-community schema risks accidental scope reuse because the community identity exists only as a process assumption.** Persist a database-level community identifier or fingerprint and refuse startup when configuration selects a different community; continue constraining all thread and aux queries by `channel_id`.
+
+8. **ADVISORY — Text event IDs risk cursor-order divergence because canonicalization and SQLite collation are unspecified.** Store lowercase 64-hex IDs with binary collation or use 32-byte BLOBs, and reject/noncanonically normalize cursor IDs before comparison.
+
+9. **ADVISORY — D5 expands M1a’s critical path beyond the four-spec gate because config-mode exercises only `X-Pubkey`.** Full fail-closed NIP-98 is appropriate for a complete production-dialect claim, but it can follow the four-spec vertical slice if schedule pressure arises; its replay cache must be scoped to the one community and method/URL checks must use the actual tenant URL.
+
+10. **ADVISORY — Treating 1012 shutdown as a stretch falls short of the full dialect contract, although it does not violate the four-spec M1a gate.** It may move to M1b because `relay-restart.live.spec.ts` is skipped, but the release should then be described as gate-conformant rather than fully restart-conformant.
+
+11. **ADVISORY — Empty presence results satisfy the documented M1a gate because none of the four specs queries presence-only filters.** The bridge should detect those filters and return an empty array explicitly, avoiding accidental SQLite treatment that could later expose persisted presence events.
+
+12. **ADVISORY — D4 inaccurately says the relay keypair “signs NIP-11” because a NIP-11 document is not itself a signed Nostr event.** The persisted key supplies the NIP-11 `self` value and signs 39005, 39006, 13534, and other relay-authored events.
+
+VERDICT: SOUND-WITH-CHANGES
