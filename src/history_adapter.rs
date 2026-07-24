@@ -119,9 +119,15 @@ fn e_kinds_spec(e: Vec<String>, kinds: Vec<u32>) -> FilterSpec {
     }
 }
 
-/// Route a plain (non-search) filter through WP1b's `query`, honoring the
-/// empty-`Some`-set-means-nothing rule.
-async fn run_query(store: &HistoryStore, filter: &Filter) -> anyhow::Result<Vec<Event>> {
+/// Route a filter through WP1b's `query`/`search`, honoring the
+/// empty-`Some`-set-means-nothing rule. `exclude_kinds` is the p-gated set,
+/// enforced at the STORE layer for NIP-50 search (Buzz nulls their search
+/// vector) — the HTTP layer keeps its own post-filter as belt-and-braces.
+async fn run_query(
+    store: &HistoryStore,
+    filter: &Filter,
+    exclude_kinds: &[u32],
+) -> anyhow::Result<Vec<Event>> {
     let limit = filter.limit.unwrap_or(QUERY_MAX_LIMIT).min(QUERY_MAX_LIMIT);
     if let Some(search) = &filter.search {
         let kinds: Vec<u32> = filter
@@ -130,9 +136,8 @@ async fn run_query(store: &HistoryStore, filter: &Filter) -> anyhow::Result<Vec<
             .map(|k| k.iter().map(|k| u32::from(k.as_u16())).collect())
             .unwrap_or_default();
         let channel = proto::filter_channels(filter).into_iter().next();
-        // p-gated exclusion is applied by the HTTP layer's post-filter.
         return store
-            .search(search, &kinds, channel.as_deref(), &[], limit)
+            .search(search, &kinds, channel.as_deref(), exclude_kinds, limit)
             .await;
     }
     let Some(spec) = to_filter_spec(filter) else {
@@ -144,11 +149,13 @@ async fn run_query(store: &HistoryStore, filter: &Filter) -> anyhow::Result<Vec<
 /// HTTP-lane engine over the durable history store.
 pub struct HistoryStoreEngine {
     store: Arc<HistoryStore>,
+    /// p-gated kinds excluded from NIP-50 search at the store layer.
+    p_gated: Vec<u32>,
 }
 
 impl HistoryStoreEngine {
-    pub fn new(store: Arc<HistoryStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<HistoryStore>, p_gated: Vec<u32>) -> Self {
+        Self { store, p_gated }
     }
 
     /// Build the two-hop aux closure for a set of row ids (dialect.md §1 step 2).
@@ -213,7 +220,7 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        run_query(&self.store, filter).await
+        run_query(&self.store, filter, &self.p_gated).await
     }
 
     async fn channel_window(&self, q: &WindowQuery) -> anyhow::Result<ChannelWindow> {
@@ -312,11 +319,12 @@ impl HistoryEngine for HistoryStoreEngine {
 /// replies is handled on the gossip/HTTP doors, not here.
 pub struct HistoryStoreEventStore {
     store: Arc<HistoryStore>,
+    p_gated: Vec<u32>,
 }
 
 impl HistoryStoreEventStore {
-    pub fn new(store: Arc<HistoryStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<HistoryStore>, p_gated: Vec<u32>) -> Self {
+        Self { store, p_gated }
     }
 }
 
@@ -331,7 +339,7 @@ impl EventStore for HistoryStoreEventStore {
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        run_query(&self.store, filter).await
+        run_query(&self.store, filter, &self.p_gated).await
     }
 
     async fn known_channels(&self) -> anyhow::Result<Vec<String>> {
