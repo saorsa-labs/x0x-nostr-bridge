@@ -194,6 +194,18 @@ impl HistoryStore {
         .map_err(|e| anyhow!("search task failed: {e}"))?
     }
 
+    /// Distinct non-null `channel_id`s across stored events, for startup topic
+    /// pre-subscribe.
+    pub async fn known_channels(&self) -> Result<Vec<String>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = lock(&conn)?;
+            query::known_channels(&guard)
+        })
+        .await
+        .map_err(|e| anyhow!("known_channels task failed: {e}"))?
+    }
+
     /// Fetch stored (non-deleted) events by id. Thin convenience over
     /// [`Self::query`] with an `ids` filter.
     pub async fn events_by_ids(&self, ids: &[String]) -> Result<Vec<Event>> {

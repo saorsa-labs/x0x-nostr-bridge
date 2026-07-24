@@ -380,6 +380,24 @@ async fn events_by_ids_fetch() {
     assert_eq!(ids, want, "known ids returned, unknown id ignored");
 }
 
+// ---- known_channels --------------------------------------------------------
+
+#[tokio::test]
+async fn known_channels_distinct() {
+    let s = store();
+    let a = Keys::generate();
+    accept(&s, &msg(&a, "in CH", 1000, vec![])).await;
+    accept(&s, &msg(&a, "also CH", 1001, vec![])).await;
+    // A message in a different channel.
+    accept(&s, &build(&a, 9, "other", 1002, vec![h("other-channel")])).await;
+    // A channel-less event (kind 0) contributes no channel.
+    accept(&s, &build(&a, 0, "profile", 1003, vec![])).await;
+
+    let mut chans = s.known_channels().await.unwrap();
+    chans.sort();
+    assert_eq!(chans, vec![CH.to_string(), "other-channel".to_string()]);
+}
+
 // ---- relay-authored + client replaceable dedup -----------------------------
 
 fn seed_39000(relay: &Keys, channel: &str, name: &str, created_at: u64) -> Event {

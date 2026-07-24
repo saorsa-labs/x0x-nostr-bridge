@@ -161,6 +161,25 @@ pub(crate) fn query(
     collect_events(conn, &sql, params)
 }
 
+/// Distinct non-null `channel_id`s across stored events, for startup topic
+/// pre-subscribe. Excludes soft-deleted rows.
+pub(crate) fn known_channels(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT channel_id FROM events \
+             WHERE channel_id IS NOT NULL AND deleted = 0 ORDER BY channel_id",
+        )
+        .context("prepare known_channels failed")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .context("known_channels query failed")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("known_channels row failed")?);
+    }
+    Ok(out)
+}
+
 /// Count matching (non-deleted) events for a filter, ignoring limit/offset.
 pub(crate) fn count(conn: &Connection, f: &FilterSpec) -> Result<u64> {
     let (where_parts, params) = build_where(f);
