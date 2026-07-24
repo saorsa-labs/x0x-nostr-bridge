@@ -1,0 +1,43 @@
+[package]
+name = "x0x-nostr-bridge"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95.0"
+license = "MIT OR Apache-2.0"
+description = "Nostr relay facade (NIP-01/29/42 subset) backed by the x0x gossip fabric — spike"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
+dashmap = "6.1"
+futures-util = "0.3"
+hex = "0.4"
+nostr = "0.44"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.20.0", features = ["v4"] }
+
+[dev-dependencies]
+rand = "0.8"
+tempfile = "3.14"
+tokio-tungstenite = "0.24"
+
+[[bin]]
+name = "x0x-nostr-bridge"
+path = "src/main.rs"
+# No `#[cfg(test)]` modules live in main.rs (all unit tests are in the library
+# modules), so suppress the redundant binary test target: `cargo test` runs the
+# library harness (the 44 module tests) once, plus the integration tests.
+test = false
