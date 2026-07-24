@@ -6,7 +6,12 @@
 //!
 //! Both wrap the SAME `Arc<HistoryStore>`, so in production the HTTP `/query`,
 //! `/events`, `/count`, the WS REQ backfill, and the WS `EVENT` door all read
-//! and write ONE store (design §4 WP5 slice / team-lead integration step 3).
+//! and write ONE store (design §4 WP5 slice / integration step 3).
+//!
+//! Reads go through WP1b's backend-agnostic [`FilterSpec`] surface
+//! (`query`/`count`/`search`). The nostr→FilterSpec mapping honours the critical
+//! semantic that an empty `Some`-set in a nostr `Filter` (matches nothing) maps
+//! to an EARLY EMPTY RETURN, never to an empty `FilterSpec` vec (UNCONSTRAINED).
 //!
 //! The two-hop aux closure (dialect.md §1) is built HERE from WP1's
 //! `WindowPage.aux_targets` (row ids): reactions(7) + deletions(5) targeting the
@@ -15,13 +20,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nostr::{Event, EventId, Filter, Kind};
+use nostr::{Event, Filter};
 
 use crate::engine_api::{
     ChannelWindow, Cursor, Emit, HistoryEngine, IngestOutcome, ThreadQuery, ThreadSummary,
     Visibility, WindowBounds, WindowQuery,
 };
-use crate::history::{self, HistoryStore};
+use crate::history::{self, FilterSpec, HistoryStore};
 use crate::kinds;
 use crate::proto;
 use crate::store::{EventStore, InsertOutcome};
@@ -67,6 +72,75 @@ fn from_window_bounds(b: history::WindowBounds) -> WindowBounds {
     }
 }
 
+/// Map a nostr `Filter` onto WP1b's `FilterSpec`. Returns `None` when the filter
+/// carries an empty `Some`-set (matches nothing) — the caller must return an
+/// empty result rather than an unconstrained query (FilterSpec empty vec =
+/// UNCONSTRAINED).
+fn to_filter_spec(f: &Filter) -> Option<FilterSpec> {
+    if f.ids.as_ref().is_some_and(|s| s.is_empty())
+        || f.authors.as_ref().is_some_and(|s| s.is_empty())
+        || f.kinds.as_ref().is_some_and(|s| s.is_empty())
+        || f.generic_tags.values().any(|s| s.is_empty())
+    {
+        return None;
+    }
+    let mut spec = FilterSpec::default();
+    if let Some(ids) = &f.ids {
+        spec.ids = ids.iter().map(|i| i.to_hex()).collect();
+    }
+    if let Some(authors) = &f.authors {
+        spec.authors = authors.iter().map(|a| a.to_hex()).collect();
+    }
+    if let Some(kinds) = &f.kinds {
+        spec.kinds = kinds.iter().map(|k| u32::from(k.as_u16())).collect();
+    }
+    for (tag, values) in &f.generic_tags {
+        match tag.as_str() {
+            "h" => spec.h = values.iter().map(|v| v.to_lowercase()).collect(),
+            "e" => spec.e = values.iter().cloned().collect(),
+            "p" => spec.p = values.iter().cloned().collect(),
+            _ => {} // FilterSpec only models #h/#e/#p.
+        }
+    }
+    spec.since = f
+        .since
+        .map(|t| i64::try_from(t.as_secs()).unwrap_or(i64::MAX));
+    spec.until = f
+        .until
+        .map(|t| i64::try_from(t.as_secs()).unwrap_or(i64::MAX));
+    Some(spec)
+}
+
+fn e_kinds_spec(e: Vec<String>, kinds: Vec<u32>) -> FilterSpec {
+    FilterSpec {
+        e,
+        kinds,
+        ..FilterSpec::default()
+    }
+}
+
+/// Route a plain (non-search) filter through WP1b's `query`, honoring the
+/// empty-`Some`-set-means-nothing rule.
+async fn run_query(store: &HistoryStore, filter: &Filter) -> anyhow::Result<Vec<Event>> {
+    let limit = filter.limit.unwrap_or(QUERY_MAX_LIMIT).min(QUERY_MAX_LIMIT);
+    if let Some(search) = &filter.search {
+        let kinds: Vec<u32> = filter
+            .kinds
+            .as_ref()
+            .map(|k| k.iter().map(|k| u32::from(k.as_u16())).collect())
+            .unwrap_or_default();
+        let channel = proto::filter_channels(filter).into_iter().next();
+        // p-gated exclusion is applied by the HTTP layer's post-filter.
+        return store
+            .search(search, &kinds, channel.as_deref(), &[], limit)
+            .await;
+    }
+    let Some(spec) = to_filter_spec(filter) else {
+        return Ok(Vec::new());
+    };
+    store.query(&spec, limit, 0).await
+}
+
 /// HTTP-lane engine over the durable history store.
 pub struct HistoryStoreEngine {
     store: Arc<HistoryStore>,
@@ -79,34 +153,25 @@ impl HistoryStoreEngine {
 
     /// Build the two-hop aux closure for a set of row ids (dialect.md §1 step 2).
     async fn aux_closure(&self, row_ids: &[String]) -> Vec<Event> {
-        let row_event_ids: Vec<EventId> = row_ids
-            .iter()
-            .filter_map(|id| EventId::parse(id).ok())
-            .collect();
-        if row_event_ids.is_empty() {
+        if row_ids.is_empty() {
             return Vec::new();
         }
+        let del = u32::from(kinds::KIND_DELETION);
+        let react = u32::from(kinds::KIND_REACTION);
         // Hop 1: reactions/deletions targeting the rows.
-        let hop1_filter = Filter::new()
-            .kinds([
-                Kind::from(kinds::KIND_DELETION),
-                Kind::from(kinds::KIND_REACTION),
-            ])
-            .events(row_event_ids);
+        let hop1 = e_kinds_spec(row_ids.to_vec(), vec![del, react]);
         let mut out = self
             .store
-            .query(&hop1_filter, QUERY_MAX_LIMIT)
+            .query(&hop1, QUERY_MAX_LIMIT, 0)
             .await
             .unwrap_or_default();
 
         // Hop 2: deletions targeting the aux events themselves.
-        let aux_ids: Vec<EventId> = out.iter().map(|e| e.id).collect();
+        let aux_ids: Vec<String> = out.iter().map(|e| e.id.to_hex()).collect();
         if !aux_ids.is_empty() {
-            let hop2_filter = Filter::new()
-                .kind(Kind::from(kinds::KIND_DELETION))
-                .events(aux_ids);
-            if let Ok(hop2) = self.store.query(&hop2_filter, QUERY_MAX_LIMIT).await {
-                out.extend(hop2);
+            let hop2 = e_kinds_spec(aux_ids, vec![del]);
+            if let Ok(h2) = self.store.query(&hop2, QUERY_MAX_LIMIT, 0).await {
+                out.extend(h2);
             }
         }
         // Dedupe by id (a deletion can appear in both hops).
@@ -148,7 +213,7 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        self.store.query(filter, QUERY_MAX_LIMIT).await
+        run_query(&self.store, filter).await
     }
 
     async fn channel_window(&self, q: &WindowQuery) -> anyhow::Result<ChannelWindow> {
@@ -204,7 +269,10 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn count(&self, filter: &Filter) -> anyhow::Result<usize> {
-        Ok(self.store.query(filter, QUERY_MAX_LIMIT).await?.len())
+        let Some(spec) = to_filter_spec(filter) else {
+            return Ok(0);
+        };
+        Ok(usize::try_from(self.store.count(&spec).await?).unwrap_or(usize::MAX))
     }
 
     async fn is_member(&self, channel_id: &str, pubkey_hex: &str) -> anyhow::Result<bool> {
@@ -228,18 +296,20 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn seed_event(&self, ev: &Event) -> anyhow::Result<()> {
-        self.store.store_relay_authored(ev).await
+        // ingest_local rejects relay-authored kinds from clients; the seeder
+        // stores its own relay-signed 39000/13534 through this door.
+        let _outcome = self.store.store_relay_authored(ev).await?;
+        Ok(())
     }
 }
 
 /// WS-lane `EventStore` over the SAME history store, so REQ backfill reads what
 /// `/query` reads. Ingest goes through the strict local door.
 ///
-/// M1a-WIRING deviations (flagged in the report): the local door does NOT do
-/// NIP-16 replaceable resolution (HistoryStore is id-PK), and a WS-door reply
-/// rejection surfaces as a generic store error rather than the Buzz reason —
-/// the HTTP `/events` door returns the exact reason. Live 39005 fan-out for
-/// WS-submitted replies is handled on the gossip/HTTP doors, not here.
+/// M1a-WIRING deviations (flagged in the report): a WS-door reply rejection
+/// surfaces as a generic store error rather than the Buzz reason — the HTTP
+/// `/events` door returns the exact reason. Live 39005 fan-out for WS-submitted
+/// replies is handled on the gossip/HTTP doors, not here.
 pub struct HistoryStoreEventStore {
     store: Arc<HistoryStore>,
 }
@@ -261,10 +331,12 @@ impl EventStore for HistoryStoreEventStore {
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        self.store.query(filter, QUERY_MAX_LIMIT).await
+        run_query(&self.store, filter).await
     }
 
     async fn known_channels(&self) -> anyhow::Result<Vec<String>> {
-        self.store.known_channels().await
+        // Topics are ensured on demand (REQ / publish); WP1b exposes no channel
+        // listing and no startup enumeration is required.
+        Ok(Vec::new())
     }
 }
