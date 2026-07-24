@@ -64,11 +64,7 @@ fn fresh_state() -> (AppState, TempDir) {
     let dir = tempfile::Builder::new().tempdir().unwrap();
     let store: Arc<dyn EventStore> =
         Arc::new(SqliteStore::open(&dir.path().join("adv.db")).unwrap());
-    let state = AppState {
-        store,
-        transport: Arc::new(NoopTransport) as Arc<dyn GossipTransport>,
-        hub: Hub::new(),
-    };
+    let state = AppState::with_defaults(store, Arc::new(NoopTransport) as Arc<dyn GossipTransport>);
     (state, dir)
 }
 

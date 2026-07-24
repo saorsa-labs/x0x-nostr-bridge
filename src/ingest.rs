@@ -3,9 +3,10 @@
 
 use tracing::warn;
 
+use crate::engine_api::IngestOutcome;
 use crate::proto;
-use crate::relay::AppState;
-use crate::store::InsertOutcome;
+use crate::relay::{publish_to_topics, AppState};
+use crate::relay_identity::now_secs;
 use crate::transport::GossipMessage;
 
 /// Process one gossip message: decode → verify → topic-bind → store/fan-out.
@@ -55,11 +56,25 @@ pub async fn ingest_one(state: &AppState, msg: &GossipMessage) {
         state.hub.dispatch(&ev);
         return;
     }
-    match state.store.insert(&ev).await {
-        Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
+    // Mesh door: park orphans / quarantine ancestry mismatches (invisible); a
+    // stored event fans out live + re-emits any thread summaries post-commit.
+    match state.engine.ingest_mesh(&ev).await {
+        Ok(IngestOutcome::Stored { emits, .. }) => {
             state.hub.dispatch(&ev);
+            for emit in emits {
+                let Some(channel) = emit.channel_id else { continue };
+                if let Ok(Some(summary)) =
+                    state.engine.thread_summary(&channel, &emit.root_id).await
+                {
+                    if let Ok(overlay) = state.identity.thread_summary_event(&summary, now_secs()) {
+                        publish_to_topics(&state.transport, &overlay).await;
+                        state.hub.dispatch(&overlay);
+                    }
+                }
+            }
         }
+        // Duplicate / Parked / Quarantined / rejected: invisible, no dispatch.
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "store insert failed"),
+        Err(e) => warn!(error = %e, "mesh ingest failed"),
     }
 }

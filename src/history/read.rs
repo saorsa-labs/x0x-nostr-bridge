@@ -6,7 +6,7 @@
 //! synthesis and signing are the HTTP/WS lane's job.
 
 use anyhow::{Context, Result};
-use nostr::{Event, JsonUtil};
+use nostr::{Event, Filter, JsonUtil};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::history::engine::{DEPTH_CAP, PARTICIPANT_CAP};
@@ -228,6 +228,120 @@ fn run_row_query(
     let mut out = Vec::new();
     for row in rows_iter {
         out.push(row.context("row read failed")?);
+    }
+    Ok(out)
+}
+
+/// `?,?,…` of length `n`.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
+/// Quote each whitespace token of a NIP-50 `search` string as a literal FTS5
+/// phrase, AND-joined — user input never becomes an FTS operator.
+fn fts_match_expr(search: &str) -> String {
+    search
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// General Nostr-filter read over the events table (WP2 seam for the plain
+/// `/query` paths — ids / directory / search / seed-check — and `/count`, plus
+/// the aux-closure resolution). Excludes soft-deleted rows; orders
+/// `created_at DESC, id ASC`. An empty `Some(set)` matches nothing (NIP-01).
+///
+/// M1a-WIRING: added by WP2 over WP1's schema so the HTTP dialect's non-window
+/// paths hit the SAME store as `channel_window`. Access classes / p-gated FTS
+/// nulling are enforced in the HTTP layer, not here.
+pub(crate) fn query(conn: &Connection, filter: &Filter, max_limit: usize) -> Result<Vec<Event>> {
+    if filter.ids.as_ref().is_some_and(|s| s.is_empty())
+        || filter.authors.as_ref().is_some_and(|s| s.is_empty())
+        || filter.kinds.as_ref().is_some_and(|s| s.is_empty())
+        || filter.generic_tags.values().any(|s| s.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+
+    let limit = filter.limit.unwrap_or(max_limit).min(max_limit);
+    let mut where_parts: Vec<String> = vec!["e.deleted = 0".to_string()];
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(ids) = &filter.ids {
+        where_parts.push(format!("e.id IN ({})", placeholders(ids.len())));
+        for v in ids {
+            params.push(SqlValue::from(v.to_hex()));
+        }
+    }
+    if let Some(authors) = &filter.authors {
+        where_parts.push(format!("e.pubkey IN ({})", placeholders(authors.len())));
+        for v in authors {
+            params.push(SqlValue::from(v.to_hex()));
+        }
+    }
+    if let Some(kinds) = &filter.kinds {
+        where_parts.push(format!("e.kind IN ({})", placeholders(kinds.len())));
+        for v in kinds {
+            params.push(SqlValue::from(i64::from(v.as_u16())));
+        }
+    }
+    if let Some(since) = filter.since {
+        where_parts.push("e.created_at >= ?".to_string());
+        params.push(SqlValue::from(i64::try_from(since.as_secs())?));
+    }
+    if let Some(until) = filter.until {
+        where_parts.push("e.created_at <= ?".to_string());
+        params.push(SqlValue::from(i64::try_from(until.as_secs())?));
+    }
+    if let Some(search) = &filter.search {
+        let fts = fts_match_expr(search);
+        if !fts.is_empty() {
+            where_parts.push(
+                "e.rowid IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)".to_string(),
+            );
+            params.push(SqlValue::from(fts));
+        }
+    }
+    for (tag, values) in &filter.generic_tags {
+        let name = tag.as_str();
+        let ph = placeholders(values.len());
+        if name == "h" {
+            where_parts.push(format!(
+                "EXISTS(SELECT 1 FROM json_each(e.tags) \
+                 WHERE json_extract(value, '$[0]') = ? \
+                   AND LOWER(json_extract(value, '$[1]')) IN ({ph}))"
+            ));
+            params.push(SqlValue::from("h".to_string()));
+            for v in values {
+                params.push(SqlValue::from(v.to_lowercase()));
+            }
+        } else {
+            where_parts.push(format!(
+                "EXISTS(SELECT 1 FROM json_each(e.tags) \
+                 WHERE json_extract(value, '$[0]') = ? \
+                   AND json_extract(value, '$[1]') IN ({ph}))"
+            ));
+            params.push(SqlValue::from(name.to_string()));
+            for v in values {
+                params.push(SqlValue::from(v.clone()));
+            }
+        }
+    }
+
+    let mut sql = String::from("SELECT e.raw FROM events e WHERE ");
+    sql.push_str(&where_parts.join(" AND "));
+    sql.push_str(" ORDER BY e.created_at DESC, e.id ASC LIMIT ?");
+    params.push(SqlValue::from(i64::try_from(limit)?));
+
+    let mut stmt = conn.prepare(&sql).context("prepare filter query failed")?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(0))
+        .context("filter query failed")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let raw = row.context("row read failed")?;
+        out.push(Event::from_json(&raw).context("failed to deserialize queried event")?);
     }
     Ok(out)
 }

@@ -5,11 +5,21 @@
 //!
 //! Ownership: this file is shared wiring; module behavior is owned per-file
 //! (see each module's doc comment).
-
+pub mod auth;
 pub mod config;
+pub mod engine_api;
+pub mod filter_match;
 pub mod history;
+pub mod history_adapter;
+pub mod http;
 pub mod ingest;
+pub mod kinds;
+pub mod nip11;
 pub mod proto;
+pub mod rate_limit;
 pub mod relay;
+pub mod relay_identity;
+pub mod seed;
+pub mod settings;
 pub mod store;
 pub mod transport;

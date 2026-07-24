@@ -155,11 +155,7 @@ impl EventStore for CountingStore {
 // ===========================================================================
 
 fn make_state(store: Arc<dyn EventStore>, transport: Arc<dyn GossipTransport>) -> Arc<AppState> {
-    Arc::new(AppState {
-        store,
-        transport,
-        hub: Hub::new(),
-    })
+    Arc::new(AppState::with_defaults(store, transport))
 }
 
 async fn spawn(state: Arc<AppState>) -> SocketAddr {

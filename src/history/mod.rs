@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use nostr::Event;
+use nostr::{Event, Filter};
 
 pub use engine::{canonical_event_id, is_relay_authored_kind};
 pub use types::{
@@ -254,6 +254,44 @@ impl HistoryStore {
         })
         .await
         .map_err(|e| anyhow!("thread_summary task failed: {e}"))?
+    }
+
+    /// General Nostr-filter read (WP2 seam): the plain `/query` paths (ids,
+    /// directory, NIP-50 search, the `kinds:[39000]` seed check), `/count`, and
+    /// aux-closure resolution. Reads the SAME store as `channel_window`, so the
+    /// WS REQ backfill and HTTP `/query` cannot diverge. `max_limit` is WP2's
+    /// per-request cap.
+    pub async fn query(&self, filter: &Filter, max_limit: usize) -> Result<Vec<Event>> {
+        let filter = filter.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<Event>> {
+            let guard = lock(&conn)?;
+            read::query(&guard, &filter, max_limit)
+        })
+        .await
+        .map_err(|e| anyhow!("history query task failed: {e}"))?
+    }
+
+    /// Distinct non-null channel ids present in the store (startup topic
+    /// pre-subscribe).
+    pub async fn known_channels(&self) -> Result<Vec<String>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = lock(&conn)?;
+            let mut stmt = guard
+                .prepare("SELECT DISTINCT channel_id FROM events WHERE channel_id IS NOT NULL")
+                .context("prepare known_channels failed")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .context("known_channels query failed")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("known_channels row failed")?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow!("known_channels task failed: {e}"))?
     }
 
     // ---- maintenance -------------------------------------------------------

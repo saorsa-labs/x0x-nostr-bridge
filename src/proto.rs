@@ -85,13 +85,21 @@ pub fn verify_event(ev: &Event) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("event verification failed: {e}"))
 }
 
-/// Validate a NIP-42 auth event against an expected challenge.
-/// `relay` tag is NOT checked (loopback bridge has no stable URL; documented
-/// spike decision — red team should probe).
+/// Compare two relay WS URLs for NIP-42 equality, tolerating a trailing slash
+/// (clients derive the tag from the relay URL, which may or may not end in `/`).
+fn relay_url_matches(actual: &str, expected: &str) -> bool {
+    actual.trim_end_matches('/') == expected.trim_end_matches('/')
+}
+
+/// Validate a NIP-42 auth event against an expected challenge and, when
+/// `expected_relay_url` is `Some`, the NIP-42 `relay` tag (WP3, issue #3:
+/// without this an AUTH is replayable across bridges within the time window).
+/// `None` skips the relay-tag check (spike/test parity).
 pub fn verify_auth_event(
     ev: &Event,
     expected_challenge: &str,
     now: Timestamp,
+    expected_relay_url: Option<&str>,
 ) -> anyhow::Result<()> {
     if ev.kind.as_u16() != AUTH_KIND {
         anyhow::bail!("auth event kind {} != {AUTH_KIND}", ev.kind.as_u16());
@@ -104,6 +112,20 @@ pub fn verify_auth_event(
         .ok_or_else(|| anyhow::anyhow!("auth event missing challenge tag"))?;
     if challenge != expected_challenge {
         anyhow::bail!("challenge mismatch");
+    }
+    // NIP-42 relay-tag binding: the signed `relay` tag must equal the tenant's
+    // own WS URL, so a challenge/response signed for one relay cannot be
+    // replayed against another.
+    if let Some(expected) = expected_relay_url {
+        let relay = ev
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("relay"))
+            .and_then(|t| t.as_slice().get(1))
+            .ok_or_else(|| anyhow::anyhow!("auth event missing relay tag"))?;
+        if !relay_url_matches(relay, expected) {
+            anyhow::bail!("relay tag mismatch");
+        }
     }
     // Asymmetric validity window: a generous `AUTH_MAX_AGE_SECS` into the past
     // (clock drift), but only `AUTH_MAX_FUTURE_SKEW_SECS` into the future to
