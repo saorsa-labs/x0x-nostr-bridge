@@ -7,6 +7,7 @@
 //! (see each module's doc comment).
 
 pub mod config;
+pub mod history;
 pub mod ingest;
 pub mod proto;
 pub mod relay;
