@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use nostr::{Event, JsonUtil};
 use rusqlite::{OptionalExtension, Transaction};
 
-use crate::history::types::{Door, IngestEffects, ThreadEmit};
+use crate::history::types::{Door, IngestEffects, RelayStoreOutcome, ThreadEmit};
 use crate::proto;
 
 /// NIP-25 reaction — stored opaque, never threaded.
@@ -172,14 +172,107 @@ pub(crate) fn ingest_event(
             }
         }
     } else {
-        // Every other kind is stored opaquely as a top-level channel message.
-        insert_event_row(tx, ev, &id, channel_id.as_deref())?;
+        // Every other kind is stored opaquely (with replaceable dedup for
+        // replaceable client kinds) as a top-level channel message.
+        let outcome = insert_deduped(tx, ev, &id, channel_id.as_deref())?;
         let mut emits = Vec::new();
-        drain_pending(tx, &id, now, &mut emits)?;
+        if outcome != RelayStoreOutcome::StaleRejected {
+            drain_pending(tx, &id, now, &mut emits)?;
+        }
         Ok(CoreOutcome::Accepted(IngestEffects {
             duplicate: false,
             emits,
         }))
+    }
+}
+
+/// Persist a relay-authored event (seed 39000, kind-13534 membership list,
+/// group state 39000-39003), bypassing the client relay-authored guard — the
+/// caller (WP2) has signed it with the relay keypair. Applies replaceable /
+/// parameterized-replaceable dedup so re-seeding keeps only the latest per
+/// `(pubkey, kind, d-tag)`. NOT a thread-engine path: relay-authored kinds are
+/// never thread-scoped, so no ancestry/counter work.
+pub(crate) fn store_relay_authored(tx: &Transaction<'_>, ev: &Event) -> Result<RelayStoreOutcome> {
+    let id = canonical_event_id(&ev.id.to_hex())?;
+    if event_exists(tx, &id)? {
+        return Ok(RelayStoreOutcome::Duplicate);
+    }
+    let channel_id = resolve_channel(ev);
+    insert_deduped(tx, ev, &id, channel_id.as_deref())
+}
+
+/// Insert an event that is already known to be new (caller dup-checked),
+/// applying NIP-01 replaceable / parameterized-replaceable dedup. Non-thread
+/// path — used by `store_relay_authored` and by the opaque client-kind branch
+/// so replaceable client kinds (0, 3, 10000-19999, 30000-39999) also collapse
+/// to their latest.
+fn insert_deduped(
+    tx: &Transaction<'_>,
+    ev: &Event,
+    id: &str,
+    channel_id: Option<&str>,
+) -> Result<RelayStoreOutcome> {
+    let kind = i64::from(ev.kind.as_u16());
+    let pubkey = ev.pubkey.to_hex();
+    let created_at = i64::try_from(ev.created_at.as_secs()).context("created_at out of i64")?;
+
+    let param_repl = proto::is_parameterized_replaceable(ev.kind);
+    let replaceable = proto::is_replaceable(ev.kind) || param_repl;
+    let d_key = if param_repl {
+        proto::d_tag(ev).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if !replaceable {
+        insert_event_row(tx, ev, id, channel_id)?;
+        return Ok(RelayStoreOutcome::Inserted);
+    }
+
+    let prev: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT created_at, event_id FROM replaceable_addrs \
+             WHERE pubkey = ?1 AND kind = ?2 AND d_tag = ?3",
+            rusqlite::params![pubkey, kind, d_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .context("replaceable_addrs lookup failed")?;
+
+    match prev {
+        // Stored wins if strictly newer, or equal-timestamp with a lower id
+        // (NIP-01 keeps the lowest event id on a tie).
+        Some((pca, pid)) if pca > created_at || (pca == created_at && pid.as_str() < id) => {
+            Ok(RelayStoreOutcome::StaleRejected)
+        }
+        Some(_) => {
+            tx.execute(
+                "DELETE FROM events WHERE id = (SELECT event_id FROM replaceable_addrs \
+                 WHERE pubkey = ?1 AND kind = ?2 AND d_tag = ?3)",
+                rusqlite::params![pubkey, kind, d_key],
+            )
+            .context("supersede delete failed")?;
+            insert_event_row(tx, ev, id, channel_id)?;
+            tx.execute(
+                "INSERT INTO replaceable_addrs(pubkey, kind, d_tag, event_id, created_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(pubkey, kind, d_tag) DO UPDATE SET \
+                 event_id = excluded.event_id, created_at = excluded.created_at",
+                rusqlite::params![pubkey, kind, d_key, id, created_at],
+            )
+            .context("replaceable_addrs upsert failed")?;
+            Ok(RelayStoreOutcome::Replaced)
+        }
+        None => {
+            insert_event_row(tx, ev, id, channel_id)?;
+            tx.execute(
+                "INSERT INTO replaceable_addrs(pubkey, kind, d_tag, event_id, created_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![pubkey, kind, d_key, id, created_at],
+            )
+            .context("replaceable_addrs insert failed")?;
+            Ok(RelayStoreOutcome::Inserted)
+        }
     }
 }
 

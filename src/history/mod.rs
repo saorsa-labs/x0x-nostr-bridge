@@ -15,6 +15,7 @@
 //! - [`types`] — the public request/response types.
 
 pub mod engine;
+mod query;
 mod read;
 mod schema;
 pub mod types;
@@ -28,8 +29,8 @@ use nostr::Event;
 
 pub use engine::{canonical_event_id, is_relay_authored_kind};
 pub use types::{
-    Door, IngestEffects, LocalIngest, MeshIngest, ThreadCursor, ThreadEmit, ThreadPage,
-    ThreadSummary, WindowBounds, WindowCursor, WindowPage,
+    Door, FilterSpec, IngestEffects, LocalIngest, MeshIngest, RelayStoreOutcome, ThreadCursor,
+    ThreadEmit, ThreadPage, ThreadSummary, WindowBounds, WindowCursor, WindowPage,
 };
 
 use engine::CoreOutcome;
@@ -110,6 +111,100 @@ impl HistoryStore {
         })
         .await
         .map_err(|e| anyhow!("history ingest task failed: {e}"))?
+    }
+
+    /// Persist a relay-authored event (seed kind-39000, kind-13534 membership
+    /// list, group state 39000-39003), bypassing the client relay-authored
+    /// guard. Applies replaceable dedup (latest per `(pubkey, kind, d-tag)`).
+    /// The caller must have signed `ev` with the relay keypair.
+    pub async fn store_relay_authored(&self, ev: &Event) -> Result<RelayStoreOutcome> {
+        let ev = ev.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<RelayStoreOutcome> {
+            let mut guard = lock(&conn)?;
+            let tx = guard.transaction()?;
+            let out = engine::store_relay_authored(&tx, &ev)?;
+            tx.commit()?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow!("store_relay_authored task failed: {e}"))?
+    }
+
+    // ---- general read surface ----------------------------------------------
+
+    /// General NIP-01 filter read over stored (non-deleted) events: the seed
+    /// poll (`kinds:[39000]`), get-event-by-ids, kind:0 directory (`offset`
+    /// paging), and aux-closure lookups. Order `created_at DESC, id ASC`;
+    /// `limit` capped at `proto::MAX_FILTER_LIMIT`.
+    pub async fn query(&self, f: &FilterSpec, limit: usize, offset: usize) -> Result<Vec<Event>> {
+        let f = f.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<Event>> {
+            let guard = lock(&conn)?;
+            query::query(&guard, &f, limit, offset)
+        })
+        .await
+        .map_err(|e| anyhow!("query task failed: {e}"))?
+    }
+
+    /// Count matching (non-deleted) events for a filter, ignoring limit/offset
+    /// (`POST /count`).
+    pub async fn count(&self, f: &FilterSpec) -> Result<u64> {
+        let f = f.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let guard = lock(&conn)?;
+            query::count(&guard, &f)
+        })
+        .await
+        .map_err(|e| anyhow!("count task failed: {e}"))?
+    }
+
+    /// NIP-50 FTS search over event content. `kinds` narrows (empty = any),
+    /// `channel` scopes to a `#h`, `exclude_kinds` removes kinds that must stay
+    /// unsearchable (WP2's p-gated set). Order `created_at DESC, id ASC`.
+    pub async fn search(
+        &self,
+        text: &str,
+        kinds: &[u32],
+        channel: Option<&str>,
+        exclude_kinds: &[u32],
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let (text, kinds, channel, exclude_kinds) = (
+            text.to_string(),
+            kinds.to_vec(),
+            channel.map(str::to_string),
+            exclude_kinds.to_vec(),
+        );
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<Event>> {
+            let guard = lock(&conn)?;
+            query::search(
+                &guard,
+                &text,
+                &kinds,
+                channel.as_deref(),
+                &exclude_kinds,
+                limit,
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("search task failed: {e}"))?
+    }
+
+    /// Fetch stored (non-deleted) events by id. Thin convenience over
+    /// [`Self::query`] with an `ids` filter.
+    pub async fn events_by_ids(&self, ids: &[String]) -> Result<Vec<Event>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let f = FilterSpec {
+            ids: ids.to_vec(),
+            ..FilterSpec::default()
+        };
+        self.query(&f, ids.len(), 0).await
     }
 
     // ---- read surface ------------------------------------------------------
