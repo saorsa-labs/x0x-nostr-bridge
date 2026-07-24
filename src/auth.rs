@@ -101,6 +101,7 @@ fn tag_value<'a>(ev: &'a Event, key: &str) -> Option<&'a str> {
 /// Establish the caller identity for an HTTP request. `require_payload` is set
 /// for writes (`POST /events`) so the NIP-98 `payload` tag (sha256 of body) is
 /// enforced.
+#[allow(clippy::too_many_arguments)]
 pub fn authenticate(
     settings: &Settings,
     replay: &ReplayCache,
@@ -114,7 +115,16 @@ pub fn authenticate(
     // NIP-98 path (always honored when the header is present and well-formed).
     if let Some(h) = header_str(headers, "authorization") {
         let b64 = h.strip_prefix("Nostr ").ok_or(AuthError::Missing)?.trim();
-        return verify_nip98(settings, replay, b64, method, path, body, require_payload, now);
+        return verify_nip98(
+            settings,
+            replay,
+            b64,
+            method,
+            path,
+            body,
+            require_payload,
+            now,
+        );
     }
 
     // Dev-auth fallback: X-Pubkey, only when NIP-98 is not required.
@@ -151,7 +161,7 @@ fn verify_nip98(
 
     // Freshness window (±ttl).
     let created = ev.created_at.as_secs();
-    let within = if created > now { created - now } else { now - created };
+    let within = created.abs_diff(now);
     if within > settings.nip98_ttl_secs {
         return Err(AuthError::Missing);
     }
@@ -162,10 +172,7 @@ fn verify_nip98(
         return Err(AuthError::Missing);
     }
     // method tag must match.
-    if tag_value(&ev, "method")
-        .map(|m| m.eq_ignore_ascii_case(method))
-        != Some(true)
-    {
+    if tag_value(&ev, "method").map(|m| m.eq_ignore_ascii_case(method)) != Some(true) {
         return Err(AuthError::Missing);
     }
     // payload tag (sha256 body) for writes.
@@ -224,8 +231,10 @@ mod tests {
 
     #[test]
     fn x_pubkey_rejected_when_token_required() {
-        let mut s = Settings::default();
-        s.require_auth_token = true;
+        let s = Settings {
+            require_auth_token: true,
+            ..Default::default()
+        };
         let replay = ReplayCache::new();
         let me = "e5ebc6cdb579be112e336cc319b5989b4bb6af11786ea90dbe52b5f08d741b34";
         let h = hdrs(&[("x-pubkey", me)]);
@@ -246,8 +255,10 @@ mod tests {
 
     #[test]
     fn nip98_accept_then_replay_reject() {
-        let mut s = Settings::default();
-        s.require_auth_token = true;
+        let s = Settings {
+            require_auth_token: true,
+            ..Default::default()
+        };
         let replay = ReplayCache::new();
         let keys = Keys::generate();
         let hdr = nip98_header(&keys, "http://localhost:3000/query", "POST", 100);
@@ -263,8 +274,10 @@ mod tests {
 
     #[test]
     fn nip98_wrong_url_rejected() {
-        let mut s = Settings::default();
-        s.require_auth_token = true;
+        let s = Settings {
+            require_auth_token: true,
+            ..Default::default()
+        };
         let replay = ReplayCache::new();
         let keys = Keys::generate();
         // u tag points at /events but request is /query

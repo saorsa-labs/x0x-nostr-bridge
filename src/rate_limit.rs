@@ -30,7 +30,9 @@ impl RateLimiter {
             *entry = (now, 0);
         }
         if entry.1 >= quota {
-            let retry = WINDOW_SECS.saturating_sub(now.saturating_sub(entry.0)).max(1);
+            let retry = WINDOW_SECS
+                .saturating_sub(now.saturating_sub(entry.0))
+                .max(1);
             return Err(retry);
         }
         entry.1 += 1;
@@ -49,7 +51,7 @@ mod tests {
         assert!(rl.check("alice", 2, 100).is_ok());
         assert!(rl.check("alice", 2, 100).is_ok());
         let retry = rl.check("alice", 2, 100).unwrap_err();
-        assert!(retry >= 1 && retry <= 60);
+        assert!((1..=60).contains(&retry));
         // a different principal is independent
         assert!(rl.check("bob", 2, 100).is_ok());
     }

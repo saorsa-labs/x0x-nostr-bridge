@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
+use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::engine_api::{ThreadSummary, WindowBounds};
 use crate::kinds;
@@ -115,7 +115,10 @@ impl RelayIdentity {
             Some(c) => format!("{channel_id}:{}:{}", c.created_at, c.id),
             None => format!("{channel_id}:head"),
         };
-        let tags = vec![Tag::parse(["d", d_tag.as_str()])?, Tag::parse(["h", channel_id])?];
+        let tags = vec![
+            Tag::parse(["d", d_tag.as_str()])?,
+            Tag::parse(["h", channel_id])?,
+        ];
         self.sign(kinds::KIND_WINDOW_BOUNDS, content, tags, now)
     }
 
@@ -144,7 +147,10 @@ impl RelayIdentity {
         members: &[String],
         now: u64,
     ) -> anyhow::Result<Event> {
-        let mut tags = vec![Tag::parse(["h", channel_id])?, Tag::parse(["d", channel_id])?];
+        let mut tags = vec![
+            Tag::parse(["h", channel_id])?,
+            Tag::parse(["d", channel_id])?,
+        ];
         for m in members {
             tags.push(Tag::parse(["p", m.as_str()])?);
         }
@@ -202,7 +208,14 @@ mod tests {
         let id = RelayIdentity::ephemeral();
         // head (no next cursor)
         let head = id
-            .window_bounds_event("general", &WindowBounds { has_more: false, next_cursor: None }, 1)
+            .window_bounds_event(
+                "general",
+                &WindowBounds {
+                    has_more: false,
+                    next_cursor: None,
+                },
+                1,
+            )
             .unwrap();
         assert_eq!(head.kind.as_u16(), kinds::KIND_WINDOW_BOUNDS);
         let content: serde_json::Value = serde_json::from_str(&head.content).unwrap();
@@ -217,11 +230,17 @@ mod tests {
         assert_eq!(d, "general:head");
 
         // with cursor
-        let c = Cursor { created_at: 1234, id: "f".repeat(64) };
+        let c = Cursor {
+            created_at: 1234,
+            id: "f".repeat(64),
+        };
         let more = id
             .window_bounds_event(
                 "general",
-                &WindowBounds { has_more: true, next_cursor: Some(c.clone()) },
+                &WindowBounds {
+                    has_more: true,
+                    next_cursor: Some(c.clone()),
+                },
                 1,
             )
             .unwrap();

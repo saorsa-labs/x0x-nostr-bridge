@@ -256,7 +256,12 @@ impl HistoryEngine for StubEngine {
                 let kind_ok = q.kinds.is_empty() || q.kinds.contains(&e.kind.as_u16());
                 in_channel && kind_ok
             })
-            .filter(|e| q.cursor.as_ref().map(|c| window_before(e, c)).unwrap_or(true))
+            .filter(|e| {
+                q.cursor
+                    .as_ref()
+                    .map(|c| window_before(e, c))
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {

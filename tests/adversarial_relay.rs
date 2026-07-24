@@ -476,7 +476,7 @@ fn i5a_auth_window_future_skew_rejected_past_window_kept() {
     let future = Timestamp::from(now.as_secs() + 300);
     let ev = auth_event_at(&keys, challenge, future);
     assert!(
-        proto::verify_auth_event(&ev, challenge, now).is_err(),
+        proto::verify_auth_event(&ev, challenge, now, None).is_err(),
         "auth event +300s in the future must be rejected"
     );
 
@@ -484,7 +484,7 @@ fn i5a_auth_window_future_skew_rejected_past_window_kept() {
     let near = Timestamp::from(now.as_secs() + 30);
     let ev_near = auth_event_at(&keys, challenge, near);
     assert!(
-        proto::verify_auth_event(&ev_near, challenge, now).is_ok(),
+        proto::verify_auth_event(&ev_near, challenge, now, None).is_ok(),
         "auth event +30s future (within allowance) must be accepted"
     );
 
@@ -492,7 +492,7 @@ fn i5a_auth_window_future_skew_rejected_past_window_kept() {
     let past = Timestamp::from(now.as_secs().saturating_sub(500));
     let ev_past = auth_event_at(&keys, challenge, past);
     assert!(
-        proto::verify_auth_event(&ev_past, challenge, now).is_ok(),
+        proto::verify_auth_event(&ev_past, challenge, now, None).is_ok(),
         "auth event -500s past (within window) must be accepted"
     );
 
@@ -500,7 +500,7 @@ fn i5a_auth_window_future_skew_rejected_past_window_kept() {
     let stale = Timestamp::from(now.as_secs().saturating_sub(700));
     let ev_stale = auth_event_at(&keys, challenge, stale);
     assert!(
-        proto::verify_auth_event(&ev_stale, challenge, now).is_err(),
+        proto::verify_auth_event(&ev_stale, challenge, now, None).is_err(),
         "auth event -700s past must be rejected"
     );
 }

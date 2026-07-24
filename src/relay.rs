@@ -441,8 +441,12 @@ async fn handle_text(
                 } else {
                     None
                 };
-                match proto::verify_auth_event(&ev, challenge, Timestamp::now(), expected.as_deref())
-                {
+                match proto::verify_auth_event(
+                    &ev,
+                    challenge,
+                    Timestamp::now(),
+                    expected.as_deref(),
+                ) {
                     Ok(()) => {
                         *authed = Some(ev.pubkey);
                         let _ = tx.send(RelayMessage::ok(ev.id, true, "")).await;
@@ -536,7 +540,11 @@ async fn handle_event(
     if let Err(e) = proto::verify_event(&ev) {
         tracing::debug!(error = %e, "event verification failed");
         let _ = tx
-            .send(RelayMessage::ok(ev.id, false, "invalid: bad id or signature"))
+            .send(RelayMessage::ok(
+                ev.id,
+                false,
+                "invalid: bad id or signature",
+            ))
             .await;
         return;
     }
@@ -699,7 +707,7 @@ pub(crate) async fn publish_to_topics(transport: &Arc<dyn GossipTransport>, ev: 
 
 #[cfg(test)]
 mod tests {
-    use super::{router, AppState, Hub};
+    use super::{router, AppState};
     use crate::proto;
     use crate::settings::Settings;
     use crate::store::{EventStore, InsertOutcome};
@@ -1010,9 +1018,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relay_tag_accepted_when_matching() {
-        let mut settings = Settings::default();
-        settings.enforce_relay_tag = true;
-        settings.public_base_url = "http://127.0.0.1:3000".into();
+        let settings = Settings {
+            enforce_relay_tag: true,
+            public_base_url: "http://127.0.0.1:3000".into(),
+            ..Default::default()
+        };
         let addr = spawn_server_with(settings).await;
         let keys = Keys::generate();
         let mut ws = connect(addr).await;
@@ -1026,9 +1036,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relay_tag_rejected_when_mismatched() {
-        let mut settings = Settings::default();
-        settings.enforce_relay_tag = true;
-        settings.public_base_url = "http://127.0.0.1:3000".into();
+        let settings = Settings {
+            enforce_relay_tag: true,
+            public_base_url: "http://127.0.0.1:3000".into(),
+            ..Default::default()
+        };
         let addr = spawn_server_with(settings).await;
         let keys = Keys::generate();
         let mut ws = connect(addr).await;
@@ -1061,8 +1073,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_connection_cap_enforced() {
-        let mut settings = Settings::default();
-        settings.max_connections = 1;
+        let settings = Settings {
+            max_connections: 1,
+            ..Default::default()
+        };
         let addr = spawn_server_with(settings).await;
         let mut ws1 = connect(addr).await;
         let _ = recv_value(&mut ws1).await;

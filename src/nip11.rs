@@ -71,8 +71,10 @@ mod tests {
         let nips = doc["supported_nips"].as_array().unwrap();
         assert!(!nips.iter().any(|v| v.as_i64() == Some(43)));
         // on when membership enforced
-        let mut s = Settings::default();
-        s.require_membership = true;
+        let s = Settings {
+            require_membership: true,
+            ..Default::default()
+        };
         let doc = document(&s, &id);
         let nips = doc["supported_nips"].as_array().unwrap();
         assert!(nips.iter().any(|v| v.as_i64() == Some(43)));
@@ -81,8 +83,10 @@ mod tests {
     #[test]
     fn nip98_advertised_when_token_required() {
         let id = RelayIdentity::ephemeral();
-        let mut s = Settings::default();
-        s.require_auth_token = true;
+        let s = Settings {
+            require_auth_token: true,
+            ..Default::default()
+        };
         let doc = document(&s, &id);
         let nips = doc["supported_nips"].as_array().unwrap();
         assert!(nips.iter().any(|v| v.as_i64() == Some(98)));

@@ -67,14 +67,22 @@ fn is_hex64(s: &str) -> bool {
 fn filter_kinds(raw: &Value) -> Vec<u16> {
     raw.get("kinds")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|k| k.as_u64().map(|n| n as u16)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k.as_u64().map(|n| n as u16))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn h_channels(raw: &Value) -> Vec<String> {
     raw.get("#h")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_lowercase)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_lowercase))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -261,7 +269,8 @@ pub async fn post_query(
 
     // Read access classes (p-gated / engram / author-only → 403).
     for raw in &raws {
-        if let Err(d) = filter_match::authorize(&state.settings.access, raw, &principal.pubkey_hex) {
+        if let Err(d) = filter_match::authorize(&state.settings.access, raw, &principal.pubkey_hex)
+        {
             return api_error(403, d.message());
         }
     }
@@ -349,7 +358,10 @@ async fn window_response(state: &Arc<AppState>, raw: &Value, caller: &str) -> Re
         }
     }
     let cursor = match (until, before_id) {
-        (Some(ts), Some(id)) => Some(Cursor { created_at: ts, id: id.to_lowercase() }),
+        (Some(ts), Some(id)) => Some(Cursor {
+            created_at: ts,
+            id: id.to_lowercase(),
+        }),
         (None, None) => None,
         _ => {
             return api_error(
@@ -371,7 +383,13 @@ async fn window_response(state: &Arc<AppState>, raw: &Value, caller: &str) -> Re
             state.engine.visibility(&channel).await,
             Ok(crate::engine_api::Visibility::Closed)
         );
-        if closed && !state.engine.is_member(&channel, caller).await.unwrap_or(false) {
+        if closed
+            && !state
+                .engine
+                .is_member(&channel, caller)
+                .await
+                .unwrap_or(false)
+        {
             return json_array(Vec::new());
         }
     }
@@ -416,7 +434,10 @@ async fn window_response(state: &Arc<AppState>, raw: &Value, caller: &str) -> Re
         }
     }
     // 4. exactly one relay-signed 39006 window-bounds overlay.
-    match state.identity.window_bounds_event(&channel, &window.bounds, now) {
+    match state
+        .identity
+        .window_bounds_event(&channel, &window.bounds, now)
+    {
         Ok(bounds) => out.push(event_to_value(&bounds)),
         Err(e) => {
             tracing::warn!(error = %e, "39006 synthesis failed");
@@ -483,7 +504,8 @@ pub async fn post_count(
         Err(e) => return api_error(400, &format!("invalid count JSON: {e}")),
     };
     for raw in &raws {
-        if let Err(d) = filter_match::authorize(&state.settings.access, raw, &principal.pubkey_hex) {
+        if let Err(d) = filter_match::authorize(&state.settings.access, raw, &principal.pubkey_hex)
+        {
             return api_error(403, d.message());
         }
     }

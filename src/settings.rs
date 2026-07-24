@@ -61,7 +61,12 @@ impl Default for Settings {
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -119,17 +124,28 @@ mod tests {
 
     #[test]
     fn relay_ws_url_swaps_scheme() {
-        let mut s = Settings::default();
-        s.public_base_url = "http://localhost:3000".into();
+        let s = Settings {
+            public_base_url: "http://localhost:3000".into(),
+            ..Default::default()
+        };
         assert_eq!(s.relay_ws_url(), "ws://localhost:3000");
-        s.public_base_url = "https://relay.example".into();
+        let s = Settings {
+            public_base_url: "https://relay.example".into(),
+            ..Default::default()
+        };
         assert_eq!(s.relay_ws_url(), "wss://relay.example");
     }
 
     #[test]
     fn nip98_expected_url_joins_path() {
         let s = Settings::default();
-        assert_eq!(s.nip98_expected_url("/events"), "http://localhost:3000/events");
-        assert_eq!(s.nip98_expected_url("/query"), "http://localhost:3000/query");
+        assert_eq!(
+            s.nip98_expected_url("/events"),
+            "http://localhost:3000/events"
+        );
+        assert_eq!(
+            s.nip98_expected_url("/query"),
+            "http://localhost:3000/query"
+        );
     }
 }

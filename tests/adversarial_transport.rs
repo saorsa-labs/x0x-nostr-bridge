@@ -34,7 +34,7 @@ use tokio::time::timeout;
 use x0x_nostr_bridge::config;
 use x0x_nostr_bridge::ingest;
 use x0x_nostr_bridge::proto;
-use x0x_nostr_bridge::relay::{AppState, Hub};
+use x0x_nostr_bridge::relay::AppState;
 use x0x_nostr_bridge::store::{EventStore, SqliteStore};
 use x0x_nostr_bridge::transport::{GossipMessage, GossipTransport, X0xTransport};
 

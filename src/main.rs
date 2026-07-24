@@ -61,14 +61,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Bridge settings + relay identity (D4).
     let settings = Arc::new(Settings::from_env());
-    let relay_key_path = PathBuf::from(
-        std::env::var("BRIDGE_RELAY_KEY").unwrap_or_else(|_| {
-            db_path
-                .with_file_name("relay.key")
-                .to_string_lossy()
-                .into_owned()
-        }),
-    );
+    let relay_key_path = PathBuf::from(std::env::var("BRIDGE_RELAY_KEY").unwrap_or_else(|_| {
+        db_path
+            .with_file_name("relay.key")
+            .to_string_lossy()
+            .into_owned()
+    }));
     let identity = Arc::new(RelayIdentity::load_or_create(&relay_key_path)?);
 
     // ONE durable history store behind both lanes: the HTTP `HistoryEngine`

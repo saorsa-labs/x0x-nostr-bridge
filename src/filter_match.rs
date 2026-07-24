@@ -7,8 +7,8 @@
 //! (`integration.spec`'s mention refetch depends on stored-query and live-match
 //! agreeing exactly).
 //!
-//! - [`matches`] is the typed hot-path matcher used by WS `Hub::dispatch` and by
-//!   the in-memory engine backfill.
+//! - [`matches()`](fn@matches) is the typed hot-path matcher used by WS
+//!   `Hub::dispatch` and by the in-memory engine backfill.
 //! - [`authorize`] enforces the p-gated / engram / author-only 403 classes over
 //!   the RAW filter value (the same value the two-pass `/query` parse keeps),
 //!   so access checks see the exact JSON the client sent.
@@ -75,9 +75,7 @@ impl ReadDenied {
     /// Exact 403 body message (dialect.md §1 read-path authorization).
     pub fn message(self) -> &'static str {
         match self {
-            ReadDenied::PGated => {
-                "restricted: p-gated kinds require #p tag matching your pubkey"
-            }
+            ReadDenied::PGated => "restricted: p-gated kinds require #p tag matching your pubkey",
             ReadDenied::Engram => {
                 "restricted: agent-engram kinds require authors or #p matching your pubkey"
             }
@@ -92,16 +90,18 @@ impl ReadDenied {
 fn filter_kinds(raw: &Value) -> Vec<u16> {
     raw.get("kinds")
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(|k| k.as_u64().map(|n| n as u16)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|k| k.as_u64().map(|n| n as u16))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// Whether a raw filter's `authors` set is exactly (and only) the caller.
 fn authors_is_self(raw: &Value, caller_hex: &str) -> bool {
     match raw.get("authors").and_then(Value::as_array) {
-        Some(arr) if !arr.is_empty() => {
-            arr.iter().all(|a| a.as_str() == Some(caller_hex))
-        }
+        Some(arr) if !arr.is_empty() => arr.iter().all(|a| a.as_str() == Some(caller_hex)),
         _ => false,
     }
 }
@@ -208,7 +208,10 @@ mod tests {
         policy.presence_kinds.insert(30078);
         policy.presence_kinds.insert(30079);
         assert!(is_presence_only(&policy, &json!({ "kinds": [30078] })));
-        assert!(is_presence_only(&policy, &json!({ "kinds": [30078, 30079] })));
+        assert!(is_presence_only(
+            &policy,
+            &json!({ "kinds": [30078, 30079] })
+        ));
         // mixed with a non-presence kind → not presence-only
         assert!(!is_presence_only(&policy, &json!({ "kinds": [30078, 9] })));
         // no kinds → not presence-only
