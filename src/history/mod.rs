@@ -15,6 +15,7 @@
 //! - [`types`] — the public request/response types.
 
 pub mod engine;
+mod query;
 mod read;
 mod schema;
 pub mod types;
@@ -24,12 +25,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use nostr::Event;
+use nostr::{Event, Filter};
 
 pub use engine::{canonical_event_id, is_relay_authored_kind};
 pub use types::{
-    Door, IngestEffects, LocalIngest, MeshIngest, ThreadCursor, ThreadEmit, ThreadPage,
-    ThreadSummary, WindowBounds, WindowCursor, WindowPage,
+    Door, IngestEffects, LocalIngest, MeshIngest, RelayStoreOutcome, ThreadCursor, ThreadEmit,
+    ThreadPage, ThreadSummary, WindowBounds, WindowCursor, WindowPage,
 };
 
 use engine::CoreOutcome;
@@ -112,7 +113,53 @@ impl HistoryStore {
         .map_err(|e| anyhow!("history ingest task failed: {e}"))?
     }
 
+    /// Persist a relay-authored event (seed kind-39000, kind-13534 membership
+    /// list, group state 39000-39003), bypassing the client relay-authored
+    /// guard. Applies replaceable dedup (latest per `(pubkey, kind, d-tag)`).
+    /// The caller must have signed `ev` with the relay keypair.
+    pub async fn store_relay_authored(&self, ev: &Event) -> Result<RelayStoreOutcome> {
+        let ev = ev.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<RelayStoreOutcome> {
+            let mut guard = lock(&conn)?;
+            let tx = guard.transaction()?;
+            let out = engine::store_relay_authored(&tx, &ev)?;
+            tx.commit()?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow!("store_relay_authored task failed: {e}"))?
+    }
+
     // ---- read surface ------------------------------------------------------
+
+    /// General NIP-01 filter read over stored (non-deleted) events: the seed
+    /// poll (`kinds:[39000]`), get-event-by-ids, kind:0 directory (`offset`
+    /// paging), NIP-50 `search`, and the aux-closure lookups. Order
+    /// `created_at DESC, id ASC`; limit capped at `proto::MAX_FILTER_LIMIT`.
+    pub async fn query(&self, filter: &Filter, offset: usize) -> Result<Vec<Event>> {
+        let filter = filter.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<Vec<Event>> {
+            let guard = lock(&conn)?;
+            query::query(&guard, &filter, offset)
+        })
+        .await
+        .map_err(|e| anyhow!("query task failed: {e}"))?
+    }
+
+    /// Count matching (non-deleted) events for a filter, ignoring limit/offset
+    /// (`POST /count`).
+    pub async fn count(&self, filter: &Filter) -> Result<usize> {
+        let filter = filter.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let guard = lock(&conn)?;
+            query::count(&guard, &filter)
+        })
+        .await
+        .map_err(|e| anyhow!("count task failed: {e}"))?
+    }
 
     /// Top-level channel timeline page (keyset `created_at DESC, id ASC`).
     pub async fn channel_window(

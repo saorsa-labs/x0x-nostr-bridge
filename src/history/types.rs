@@ -33,6 +33,19 @@ pub struct IngestEffects {
     pub emits: Vec<ThreadEmit>,
 }
 
+/// Outcome of persisting a relay-authored event (seed 39000, kind-13534
+/// membership list, group state 39000-39003) via
+/// [`crate::history::HistoryStore::store_relay_authored`]. Replaceable and
+/// parameterized-replaceable kinds keep only the latest per `(pubkey, kind,
+/// d-tag)` (NIP-01 tie-break: equal `created_at` keeps the lowest event id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayStoreOutcome {
+    Inserted,
+    Duplicate,
+    Replaced,
+    StaleRejected,
+}
+
 /// Outcome of the strict local door.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalIngest {

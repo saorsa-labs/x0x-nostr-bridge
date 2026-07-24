@@ -12,8 +12,10 @@
 
 use std::time::Duration;
 
-use nostr::{Event, EventBuilder, Keys, Kind, TagKind, Timestamp};
-use x0x_nostr_bridge::history::types::{LocalIngest, MeshIngest};
+use nostr::{
+    Alphabet, Event, EventBuilder, Filter, Keys, Kind, SingleLetterTag, TagKind, Timestamp,
+};
+use x0x_nostr_bridge::history::types::{LocalIngest, MeshIngest, RelayStoreOutcome};
 use x0x_nostr_bridge::history::{
     canonical_event_id, is_relay_authored_kind, HistoryStore, ThreadCursor, WindowCursor,
 };
@@ -841,4 +843,204 @@ async fn orphan_ttl_reap() {
         .await
         .unwrap();
     assert_eq!(reaped, 1, "the stale orphan is reaped");
+}
+
+// ---- general filter read + relay-authored store (WP2 substrate) ------------
+
+fn h_letter() -> SingleLetterTag {
+    SingleLetterTag::lowercase(Alphabet::H)
+}
+
+/// A relay-authored kind-39000 channel-metadata event (`d` = channel), signed
+/// here by an arbitrary "relay" key.
+fn seed_39000(relay: &Keys, channel: &str, name: &str, created_at: u64) -> Event {
+    build(
+        relay,
+        39000,
+        name,
+        created_at,
+        vec![h(channel), tag("d", &[channel]), tag("name", &[name])],
+    )
+}
+
+#[tokio::test]
+async fn relay_authored_seed_is_servable() {
+    let s = store();
+    let relay = Keys::generate();
+    let seed = seed_39000(&relay, CH, "general", 1000);
+
+    assert_eq!(
+        s.store_relay_authored(&seed).await.unwrap(),
+        RelayStoreOutcome::Inserted
+    );
+
+    // assertRelaySeeded()-shaped poll: kinds:[39000] + #h:[CH].
+    let filter = Filter::new()
+        .kinds([Kind::from(39000u16)])
+        .custom_tag(h_letter(), CH);
+    let got = s.query(&filter, 0).await.unwrap();
+    assert_eq!(got.len(), 1, "seed 39000 is servable");
+    assert_eq!(got[0].id, seed.id);
+    // A client cannot author it (relay-authored guard).
+    match s
+        .ingest_local(&seed_39000(&relay, CH, "spoof", 1001))
+        .await
+        .unwrap()
+    {
+        LocalIngest::Rejected(r) => assert!(r.contains("relay-authored")),
+        LocalIngest::Accepted(_) => panic!("client 39000 must be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn relay_authored_replaceable_dedup() {
+    let s = store();
+    let relay = Keys::generate();
+    assert_eq!(
+        s.store_relay_authored(&seed_39000(&relay, CH, "v1", 1000))
+            .await
+            .unwrap(),
+        RelayStoreOutcome::Inserted
+    );
+    let v2 = seed_39000(&relay, CH, "v2", 2000);
+    assert_eq!(
+        s.store_relay_authored(&v2).await.unwrap(),
+        RelayStoreOutcome::Replaced
+    );
+    // Older re-submission loses.
+    assert_eq!(
+        s.store_relay_authored(&seed_39000(&relay, CH, "v0", 500))
+            .await
+            .unwrap(),
+        RelayStoreOutcome::StaleRejected
+    );
+
+    let filter = Filter::new().kinds([Kind::from(39000u16)]);
+    let got = s.query(&filter, 0).await.unwrap();
+    assert_eq!(got.len(), 1, "only the latest metadata survives");
+    assert_eq!(got[0].id, v2.id);
+}
+
+#[tokio::test]
+async fn client_replaceable_kind0_dedup_via_ingest() {
+    // Kind 0 (profile) is replaceable; the opaque ingest branch must dedup it.
+    let s = store();
+    let a = Keys::generate();
+    accept_local(&s, &build(&a, 0, "old profile", 1000, vec![])).await;
+    accept_local(&s, &build(&a, 0, "new profile", 2000, vec![])).await;
+
+    let got = s
+        .query(
+            &Filter::new()
+                .author(a.public_key())
+                .kinds([Kind::from(0u16)]),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "only latest profile kept");
+    assert_eq!(got[0].content, "new profile");
+}
+
+#[tokio::test]
+async fn query_by_ids_kinds_search_and_deleted_exclusion() {
+    let s = store();
+    let a = Keys::generate();
+    let m1 = msg(&a, "rust async programming", 1000, vec![]);
+    let m2 = msg(&a, "garden tomatoes recipe", 1001, vec![]);
+    accept_local(&s, &m1).await;
+    accept_local(&s, &m2).await;
+
+    // by ids
+    let by_id = s.query(&Filter::new().id(m1.id), 0).await.unwrap();
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id[0].id, m1.id);
+
+    // by kinds + #h
+    let by_kind = s
+        .query(
+            &Filter::new()
+                .kinds([Kind::from(9u16)])
+                .custom_tag(h_letter(), CH),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_kind.len(), 2);
+
+    // FTS search
+    let hits = s.query(&Filter::new().search("rust"), 0).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, m1.id);
+
+    // count
+    assert_eq!(
+        s.count(&Filter::new().kinds([Kind::from(9u16)]))
+            .await
+            .unwrap(),
+        2
+    );
+
+    // deleting m1 removes it from both filter reads and FTS.
+    let del = build(
+        &a,
+        5,
+        "del",
+        1002,
+        vec![h(CH), tag("e", &[&m1.id.to_hex()])],
+    );
+    accept_local(&s, &del).await;
+    assert!(s
+        .query(&Filter::new().id(m1.id), 0)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(s
+        .query(&Filter::new().search("rust"), 0)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.count(&Filter::new().kinds([Kind::from(9u16)]))
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn query_offset_paging_directory() {
+    // kind:0 directory across four distinct authors, offset-paged.
+    let s = store();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let k = Keys::generate();
+        let ev = build(&k, 0, &format!("profile-{i}"), 1000 + i, vec![]);
+        ids.push(ev.id.to_hex());
+        accept_local(&s, &ev).await;
+    }
+
+    let page1 = s
+        .query(&Filter::new().kinds([Kind::from(0u16)]).limit(2), 0)
+        .await
+        .unwrap();
+    let page2 = s
+        .query(&Filter::new().kinds([Kind::from(0u16)]).limit(2), 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page2.len(), 2);
+
+    let mut seen: Vec<String> = page1
+        .iter()
+        .chain(page2.iter())
+        .map(|e| e.id.to_hex())
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        4,
+        "offset paging covers all four with no overlap"
+    );
 }

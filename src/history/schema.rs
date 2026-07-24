@@ -87,6 +87,19 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
             PRIMARY KEY (channel_id, pubkey)
         );
 
+        -- Replaceable bookkeeping for relay-authored state kinds (39000-39003
+        -- group state, kind-13534 membership list): one row per
+        -- (pubkey, kind, d-tag) slot pointing at the currently-winning event.
+        -- Non-parameterized replaceable kinds use d_tag ''.
+        CREATE TABLE IF NOT EXISTS replaceable_addrs (
+            pubkey     TEXT NOT NULL,
+            kind       INTEGER NOT NULL,
+            d_tag      TEXT NOT NULL,
+            event_id   TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (pubkey, kind, d_tag)
+        );
+
         CREATE TABLE IF NOT EXISTS nip98_seen (
             event_id   TEXT PRIMARY KEY,
             expires_at INTEGER NOT NULL
