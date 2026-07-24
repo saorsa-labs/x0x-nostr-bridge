@@ -153,6 +153,12 @@ pub trait HistoryEngine: Send + Sync {
     async fn seed_visibility(&self, _channel_id: &str, _vis: Visibility) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Store a relay-authored event (kind-39000 metadata / kind-13534 membership
+    /// list) directly, bypassing the client-submission guard the two doors apply
+    /// (WP4 seed / relay-authored group state). Default no-op.
+    async fn seed_event(&self, _ev: &Event) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Keyset DESC-walk predicate (design §3): keep rows strictly before the cursor
@@ -352,6 +358,11 @@ impl HistoryEngine for StubEngine {
 
     async fn seed_visibility(&self, channel_id: &str, vis: Visibility) -> anyhow::Result<()> {
         self.set_visibility(channel_id, vis).await;
+        Ok(())
+    }
+
+    async fn seed_event(&self, ev: &Event) -> anyhow::Result<()> {
+        self.store(ev).await;
         Ok(())
     }
 }

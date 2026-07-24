@@ -272,6 +272,36 @@ impl HistoryStore {
         .map_err(|e| anyhow!("history query task failed: {e}"))?
     }
 
+    /// Store a relay-authored event (kind-39000 channel metadata, kind-13534
+    /// membership list) that the two-door ingest deliberately rejects from
+    /// clients. Only the relay/seeder calls this. Idempotent by event id.
+    pub async fn store_relay_authored(&self, ev: &Event) -> Result<()> {
+        let ev = ev.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let id = engine::canonical_event_id(&ev.id.to_hex())?;
+            let mut guard = lock(&conn)?;
+            let tx = guard.transaction()?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE id = ?1",
+                    rusqlite::params![id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .context("relay-authored existence check failed")?
+                .is_some();
+            if !exists {
+                let channel = engine::resolve_channel(&ev);
+                engine::insert_event_row(&tx, &ev, &id, channel.as_deref())?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("store_relay_authored task failed: {e}"))?
+    }
+
     /// Distinct non-null channel ids present in the store (startup topic
     /// pre-subscribe).
     pub async fn known_channels(&self) -> Result<Vec<String>> {

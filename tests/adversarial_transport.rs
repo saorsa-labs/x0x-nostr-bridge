@@ -93,10 +93,12 @@ async fn serve(app: Router) -> std::net::SocketAddr {
     addr
 }
 
-/// How many stored events were signed by `keys` (author filter always matches).
+/// Stored events signed by `keys`. Gossip ingest goes through the mesh door of
+/// the history engine now (integration step 3), so observe the engine, not the
+/// spike EventStore.
 async fn stored_by(state: &AppState, keys: &Keys) -> Vec<Event> {
     state
-        .store
+        .engine
         .query(&nostr::Filter::new().author(keys.public_key()))
         .await
         .unwrap()

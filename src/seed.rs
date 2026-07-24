@@ -52,7 +52,7 @@ pub async fn seed_demo(state: &Arc<AppState>) -> anyhow::Result<()> {
     let general = state
         .identity
         .channel_metadata_event("general", "general", now)?;
-    state.engine.ingest_local(&general).await?;
+    state.engine.seed_event(&general).await?;
     state
         .engine
         .seed_visibility("general", Visibility::Open)
@@ -68,14 +68,14 @@ pub async fn seed_demo(state: &Arc<AppState>) -> anyhow::Result<()> {
     let list = state
         .identity
         .membership_list_event("general", &member_pubkeys, now)?;
-    state.engine.ingest_local(&list).await?;
+    state.engine.seed_event(&list).await?;
 
     // alice-tyler DM channel.
     let dm_id = dm_channel_id("alice-tyler");
     let dm = state
         .identity
         .channel_metadata_event(&dm_id, "alice-tyler", now)?;
-    state.engine.ingest_local(&dm).await?;
+    state.engine.seed_event(&dm).await?;
     state
         .engine
         .seed_visibility(&dm_id, Visibility::Closed)

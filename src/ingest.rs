@@ -62,7 +62,9 @@ pub async fn ingest_one(state: &AppState, msg: &GossipMessage) {
         Ok(IngestOutcome::Stored { emits, .. }) => {
             state.hub.dispatch(&ev);
             for emit in emits {
-                let Some(channel) = emit.channel_id else { continue };
+                let Some(channel) = emit.channel_id else {
+                    continue;
+                };
                 if let Ok(Some(summary)) =
                     state.engine.thread_summary(&channel, &emit.root_id).await
                 {

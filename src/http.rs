@@ -214,7 +214,9 @@ pub async fn post_events(
 /// emit is corrected by the next reply or by a window's `include_summaries`.
 pub(crate) fn fan_out_emits(state: &Arc<AppState>, emits: Vec<crate::engine_api::Emit>) {
     for emit in emits {
-        let Some(channel) = emit.channel_id else { continue };
+        let Some(channel) = emit.channel_id else {
+            continue;
+        };
         let root = emit.root_id;
         let state = Arc::clone(state);
         tokio::spawn(async move {
@@ -315,7 +317,10 @@ pub async fn post_query(
         // NIP-50 FTS never returns p-gated kinds (Buzz nulls their search vector).
         if raw.get("search").is_some() {
             events.retain(|ev| {
-                !filter_match::p_gated_excluded_from_search(&state.settings.access, ev.kind.as_u16())
+                !filter_match::p_gated_excluded_from_search(
+                    &state.settings.access,
+                    ev.kind.as_u16(),
+                )
             });
         }
         // Offset paging (`page` > 1) + limit truncation for the plain path.

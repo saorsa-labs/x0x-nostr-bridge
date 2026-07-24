@@ -208,7 +208,11 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn is_member(&self, channel_id: &str, pubkey_hex: &str) -> anyhow::Result<bool> {
-        Ok(self.store.member_role(channel_id, pubkey_hex).await?.is_some())
+        Ok(self
+            .store
+            .member_role(channel_id, pubkey_hex)
+            .await?
+            .is_some())
     }
 
     async fn visibility(&self, _channel_id: &str) -> anyhow::Result<Visibility> {
@@ -218,7 +222,13 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn seed_member(&self, channel_id: &str, pubkey_hex: &str) -> anyhow::Result<()> {
-        self.store.upsert_member(channel_id, pubkey_hex, "member").await
+        self.store
+            .upsert_member(channel_id, pubkey_hex, "member")
+            .await
+    }
+
+    async fn seed_event(&self, ev: &Event) -> anyhow::Result<()> {
+        self.store.store_relay_authored(ev).await
     }
 }
 

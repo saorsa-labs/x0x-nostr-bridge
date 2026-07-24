@@ -336,7 +336,9 @@ pub(crate) fn query(conn: &Connection, filter: &Filter, max_limit: usize) -> Res
 
     let mut stmt = conn.prepare(&sql).context("prepare filter query failed")?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(0))
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            r.get::<_, String>(0)
+        })
         .context("filter query failed")?;
     let mut out = Vec::new();
     for row in rows {

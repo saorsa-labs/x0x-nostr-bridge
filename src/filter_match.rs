@@ -54,7 +54,9 @@ impl Default for AccessPolicy {
         // from source). Presence kinds remain empty (Buzz synthesizes presence
         // from Redis; the M1a gate never queries it). Config-pluggable.
         Self {
-            p_gated_kinds: [24200, 44100, 44101, 1059, 30622, 44200].into_iter().collect(),
+            p_gated_kinds: [24200, 44100, 44101, 1059, 30622, 44200]
+                .into_iter()
+                .collect(),
             engram_kinds: [30174].into_iter().collect(),
             author_only_kinds: [30300, 30350].into_iter().collect(),
             result_gated_kinds: [30622, 44200].into_iter().collect(),
@@ -149,7 +151,8 @@ pub fn is_presence_only(policy: &AccessPolicy, raw: &Value) -> bool {
 fn event_p_tags_contain(ev: &Event, caller_hex: &str) -> bool {
     ev.tags.iter().any(|t| {
         let s = t.as_slice();
-        s.first().map(String::as_str) == Some("p") && s.get(1).map(String::as_str) == Some(caller_hex)
+        s.first().map(String::as_str) == Some("p")
+            && s.get(1).map(String::as_str) == Some(caller_hex)
     })
 }
 
@@ -157,8 +160,7 @@ fn event_p_tags_contain(ev: &Event, caller_hex: &str) -> bool {
 /// result: result-gated kind whose `#p` does not match the reader (id-probe
 /// leak defense — even `ids:[…]` must not surface these).
 pub fn result_gated_hidden(policy: &AccessPolicy, ev: &Event, caller_hex: &str) -> bool {
-    policy.result_gated_kinds.contains(&ev.kind.as_u16())
-        && !event_p_tags_contain(ev, caller_hex)
+    policy.result_gated_kinds.contains(&ev.kind.as_u16()) && !event_p_tags_contain(ev, caller_hex)
 }
 
 /// Whether a p-gated kind should be excluded from NIP-50 FTS results (Buzz nulls

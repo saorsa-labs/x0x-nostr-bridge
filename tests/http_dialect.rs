@@ -65,11 +65,13 @@ impl HistoryEngine for CannedEngine {
     async fn ingest_local(&self, ev: &Event) -> anyhow::Result<IngestOutcome> {
         Ok(IngestOutcome::Stored {
             event_id: ev.id.to_hex(),
+            emits: Vec::new(),
         })
     }
     async fn ingest_mesh(&self, ev: &Event) -> anyhow::Result<IngestOutcome> {
         Ok(IngestOutcome::Stored {
             event_id: ev.id.to_hex(),
+            emits: Vec::new(),
         })
     }
     async fn query(&self, _f: &Filter) -> anyhow::Result<Vec<Event>> {

@@ -706,7 +706,7 @@ fn pending_children(tx: &Transaction<'_>, parent: &str) -> Result<Vec<(String, S
 }
 
 /// Insert a fresh event row (`deleted = 0`). Caller has already dup-checked.
-fn insert_event_row(
+pub(crate) fn insert_event_row(
     tx: &Transaction<'_>,
     ev: &Event,
     id: &str,
@@ -768,7 +768,7 @@ fn tag_vecs(ev: &Event) -> Vec<Vec<String>> {
 }
 
 /// First resolvable `#h` channel of an event, lowercased (`None` = global).
-fn resolve_channel(ev: &Event) -> Option<String> {
+pub(crate) fn resolve_channel(ev: &Event) -> Option<String> {
     proto::event_channels(ev).into_iter().next()
 }
 
