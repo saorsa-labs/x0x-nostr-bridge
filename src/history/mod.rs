@@ -7,11 +7,11 @@
 //! transaction.
 //!
 //! Module layout (design §4 WP1):
-//! - [`schema`] — the §3 schema + community-fingerprint guard.
+//! - `schema` — the §3 schema + community-fingerprint guard.
 //! - [`engine`] — the thread engine (`thread_engine.rs` in the design; kept as
 //!   `history::engine` so it can share the store's connection/transaction type
 //!   without leaking it publicly).
-//! - [`read`] — the window/thread/summary read surface.
+//! - `read` — the window/thread/summary read surface.
 //! - [`types`] — the public request/response types.
 
 pub mod engine;
@@ -258,7 +258,8 @@ impl HistoryStore {
 fn lock(
     conn: &Mutex<rusqlite::Connection>,
 ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    conn.lock().map_err(|e| anyhow!("history db mutex poisoned: {e}"))
+    conn.lock()
+        .map_err(|e| anyhow!("history db mutex poisoned: {e}"))
 }
 
 /// Current wall-clock unix seconds (local-door `last_reply_at`).

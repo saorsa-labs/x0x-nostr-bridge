@@ -5,7 +5,7 @@
 //! parent-must-exist rejects, server-verified root with the parent-has-no-row
 //! re-derivation branch, depth cap 100, lazy parent/root stub rows, and the two
 //! transactional counters. Both doors share one validation core
-//! ([`resolve_reply`]); the doors differ only in how they treat a missing parent
+//! (`resolve_reply`); the doors differ only in how they treat a missing parent
 //! (local reject vs mesh park) and an ancestry mismatch (local reject vs mesh
 //! quarantine).
 //!
@@ -228,9 +228,7 @@ fn resolve_reply(
     // Server-verified root + depth (thread.md §1.4 step 3-4).
     let (effective_root, depth) = match load_thread_meta(tx, parent_hex)? {
         Some(pm) => {
-            let er = pm
-                .root_event_id
-                .unwrap_or_else(|| parent_hex.to_string());
+            let er = pm.root_event_id.unwrap_or_else(|| parent_hex.to_string());
             let depth = pm.depth.unwrap_or(0) + 1;
             if depth > DEPTH_CAP {
                 return Ok(ReplyResolution::Mismatch(
@@ -329,8 +327,7 @@ fn insert_reply(
 /// `INSERT OR IGNORE` a depth-0 stub for an existing event (its row is created
 /// lazily the first time a reply needs to bump it, thread.md §1.5).
 fn insert_stub(tx: &Transaction<'_>, id: &str) -> Result<()> {
-    let m = load_event_meta(tx, id)?
-        .ok_or_else(|| anyhow!("stub target event {id} missing"))?;
+    let m = load_event_meta(tx, id)?.ok_or_else(|| anyhow!("stub target event {id} missing"))?;
     tx.execute(
         "INSERT OR IGNORE INTO thread_metadata\
          (event_id, event_created_at, channel_id, parent_event_id, root_event_id, depth, \
@@ -443,7 +440,11 @@ fn park(tx: &Transaction<'_>, ev: &Event, id: &str, parent: &str, now: i64) -> R
         rusqlite::params![id, parent, ev.as_json(), now],
     )
     .context("park orphan failed")?;
-    tracing::debug!(event_id = id, parent = parent, "mesh reply parked (parent missing)");
+    tracing::debug!(
+        event_id = id,
+        parent = parent,
+        "mesh reply parked (parent missing)"
+    );
     Ok(())
 }
 
@@ -454,7 +455,11 @@ fn quarantine(tx: &Transaction<'_>, ev: &Event, id: &str, reason: &str, now: i64
         rusqlite::params![id, ev.as_json(), reason, now],
     )
     .context("quarantine failed")?;
-    tracing::warn!(event_id = id, reason = reason, "mesh event quarantined (ancestry mismatch)");
+    tracing::warn!(
+        event_id = id,
+        reason = reason,
+        "mesh event quarantined (ancestry mismatch)"
+    );
     Ok(())
 }
 

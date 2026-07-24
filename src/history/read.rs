@@ -14,6 +14,9 @@ use crate::history::types::{
     ThreadCursor, ThreadPage, ThreadSummary, WindowBounds, WindowCursor, WindowPage,
 };
 
+/// Owned SQL value used to build heterogeneous parameter lists.
+type SqlValue = rusqlite::types::Value;
+
 /// Clamp a caller-supplied page limit to a sane range. WP2 owns the Buzz
 /// 50/200 policy; this only guards against 0 and pathological values (the
 /// `limit + 1` probe must not overflow or select the whole table).
@@ -21,13 +24,12 @@ fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 500)
 }
 
-/// Aux kinds are never timeline rows: reactions (7), deletions (5 / NIP-29
-/// 9005) are appended as the aux closure, not as window rows. The design's
-/// top-level predicate is depth-only because Buzz applies it to a kind-filtered
-/// set; excluding these here keeps a reaction from surfacing as a row.
-const AUX_ROW_KINDS: [i64; 3] = [5, 7, 9005];
-
 /// Top-level channel timeline, keyset-paginated `created_at DESC, id ASC`.
+///
+/// Aux kinds (reactions 7, deletions 5 / NIP-29 9005) are never timeline rows —
+/// they are the aux closure, appended separately by WP2. The design's top-level
+/// predicate is depth-only because Buzz applies it to a kind-filtered set;
+/// excluding these here keeps a reaction from surfacing as a row.
 pub(crate) fn channel_window(
     conn: &Connection,
     channel_id: &str,
@@ -37,51 +39,33 @@ pub(crate) fn channel_window(
     let lim = clamp_limit(limit);
     let fetch = lim + 1;
 
+    let mut params: Vec<SqlValue> = vec![SqlValue::from(channel_id.to_string())];
     // NORMATIVE window keyset (DESC walk): created_at < :ts OR (== :ts AND id > :id).
-    let (cursor_sql, cursor_ts, cursor_id) = match &cursor {
-        Some(c) => (
-            " AND (e.created_at < ?2 OR (e.created_at = ?2 AND e.id > ?3))",
-            c.created_at,
-            c.id.clone(),
-        ),
-        None => ("", 0_i64, String::new()),
+    let cursor_sql = if let Some(c) = &cursor {
+        params.push(SqlValue::from(c.created_at));
+        params.push(SqlValue::from(c.created_at));
+        params.push(SqlValue::from(c.id.clone()));
+        " AND (e.created_at < ? OR (e.created_at = ? AND e.id > ?))"
+    } else {
+        ""
     };
+    params.push(SqlValue::from(i64::try_from(fetch)?));
 
     let sql = format!(
         "SELECT e.raw, e.created_at, e.id \
          FROM events e LEFT JOIN thread_metadata tm ON tm.event_id = e.id \
-         WHERE e.channel_id = ?1 AND e.deleted = 0 \
+         WHERE e.channel_id = ? AND e.deleted = 0 \
            AND e.kind NOT IN (5, 7, 9005) \
            AND (tm.depth IS NULL OR tm.depth = 0 OR (tm.depth = 1 AND tm.broadcast = 1)){cursor_sql} \
-         ORDER BY e.created_at DESC, e.id ASC LIMIT ?4"
+         ORDER BY e.created_at DESC, e.id ASC LIMIT ?"
     );
-    let _ = AUX_ROW_KINDS; // documented inline in the SQL above
 
-    let mut stmt = conn.prepare(&sql).context("prepare channel_window failed")?;
-    let rows_iter = stmt
-        .query_map(
-            rusqlite::params![channel_id, cursor_ts, cursor_id, i64::try_from(fetch)?],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .context("channel_window query failed")?;
-
-    let mut raws: Vec<(String, i64, String)> = Vec::new();
-    for row in rows_iter {
-        raws.push(row.context("channel_window row failed")?);
-    }
-    drop(stmt);
+    let mut raws = run_row_query(conn, &sql, params)?;
 
     let has_more = raws.len() == fetch;
     if has_more {
         raws.truncate(lim);
     }
-
     let next_cursor = if has_more {
         raws.last().map(|(_, ca, id)| WindowCursor {
             created_at: *ca,
@@ -129,43 +113,27 @@ pub(crate) fn thread_replies(
     let fetch = lim + 1;
     let dl = depth_limit.map_or(DEPTH_CAP, i64::from);
 
+    let mut params: Vec<SqlValue> = vec![SqlValue::from(root.to_string()), SqlValue::from(dl)];
     // NORMATIVE thread keyset (ASC walk): created_at > :ts OR (== :ts AND id > :id).
-    let (cursor_sql, cursor_ts, cursor_id) = match &cursor {
-        Some(c) => (
-            " AND (tm.event_created_at > ?3 OR (tm.event_created_at = ?3 AND tm.event_id > ?4))",
-            c.created_at,
-            c.id.clone(),
-        ),
-        None => ("", 0_i64, String::new()),
+    let cursor_sql = if let Some(c) = &cursor {
+        params.push(SqlValue::from(c.created_at));
+        params.push(SqlValue::from(c.created_at));
+        params.push(SqlValue::from(c.id.clone()));
+        " AND (tm.event_created_at > ? OR (tm.event_created_at = ? AND tm.event_id > ?))"
+    } else {
+        ""
     };
+    params.push(SqlValue::from(i64::try_from(fetch)?));
 
     let sql = format!(
         "SELECT e.raw, tm.event_created_at, tm.event_id \
          FROM thread_metadata tm JOIN events e ON e.id = tm.event_id \
-         WHERE tm.root_event_id = ?1 AND e.deleted = 0 \
-           AND tm.depth >= 1 AND tm.depth <= ?2{cursor_sql} \
-         ORDER BY tm.event_created_at ASC, tm.event_id ASC LIMIT ?5"
+         WHERE tm.root_event_id = ? AND e.deleted = 0 \
+           AND tm.depth >= 1 AND tm.depth <= ?{cursor_sql} \
+         ORDER BY tm.event_created_at ASC, tm.event_id ASC LIMIT ?"
     );
 
-    let mut stmt = conn.prepare(&sql).context("prepare thread_replies failed")?;
-    let rows_iter = stmt
-        .query_map(
-            rusqlite::params![root, dl, cursor_ts, cursor_id, i64::try_from(fetch)?],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .context("thread_replies query failed")?;
-
-    let mut raws: Vec<(String, i64, String)> = Vec::new();
-    for row in rows_iter {
-        raws.push(row.context("thread_replies row failed")?);
-    }
-    drop(stmt);
+    let mut raws = run_row_query(conn, &sql, params)?;
 
     let has_more = raws.len() == fetch;
     if has_more {
@@ -239,4 +207,27 @@ pub(crate) fn thread_summary(conn: &Connection, root: &str) -> Result<Option<Thr
         last_reply_at,
         participants,
     }))
+}
+
+/// Run a `(raw, created_at, id)` row query and collect the results.
+fn run_row_query(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<SqlValue>,
+) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare(sql).context("prepare row query failed")?;
+    let rows_iter = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .context("row query failed")?;
+    let mut out = Vec::new();
+    for row in rows_iter {
+        out.push(row.context("row read failed")?);
+    }
+    Ok(out)
 }
