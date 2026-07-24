@@ -343,8 +343,8 @@ impl EventStore for HistoryStoreEventStore {
     }
 
     async fn known_channels(&self) -> anyhow::Result<Vec<String>> {
-        // Topics are ensured on demand (REQ / publish); WP1b exposes no channel
-        // listing and no startup enumeration is required.
-        Ok(Vec::new())
+        // Startup topic pre-subscribe (survives restart) via WP1's DISTINCT
+        // channel_id accessor (PR #8).
+        self.store.known_channels().await
     }
 }
