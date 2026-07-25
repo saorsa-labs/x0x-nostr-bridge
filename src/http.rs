@@ -23,6 +23,7 @@ use crate::auth;
 use crate::engine_api::{event_to_value, Cursor, IngestOutcome, ThreadQuery, WindowQuery};
 use crate::filter_match;
 use crate::kinds;
+use crate::nip29;
 use crate::proto;
 use crate::relay::{publish_to_topics, AppState};
 use crate::relay_identity::now_secs;
@@ -180,6 +181,20 @@ pub async fn post_events(
         return api_error(400, "invalid: relay-authored kind may not be submitted");
     }
 
+    // NIP-29 command execution (WP-B). A group command is an instruction, not a
+    // record: the client reads back the 39000/39001/39002 the relay emits, so
+    // the materialization has to happen before the command is stored — and a
+    // command that fails validation must not be stored (or gossiped) at all.
+    if kinds::is_group_command(ev.kind.as_u16()) {
+        match nip29::execute(&state, &ev).await {
+            Ok(events) => fan_out_group_state(&state, &events).await,
+            // A moderation refusal is an authorization outcome, not a malformed
+            // request — same 403 the membership gate above returns.
+            Err(reason) if reason.starts_with("restricted:") => return api_error(403, &reason),
+            Err(reason) => return api_error(400, &reason),
+        }
+    }
+
     // Ingest through the local door.
     match state.engine.ingest_local(&ev).await {
         Ok(IngestOutcome::Stored { event_id, emits }) => {
@@ -205,6 +220,17 @@ pub async fn post_events(
             tracing::warn!(error = %e, "ingest_local failed");
             api_error(500, "internal error")
         }
+    }
+}
+
+/// Post-commit fan-out for the relay-authored group state a NIP-29 command
+/// materialized (WP-B). [`nip29::execute`] has already stored each event; this
+/// puts it on the fabric and in front of live subscribers so a second client
+/// sees the new channel without re-querying.
+pub(crate) async fn fan_out_group_state(state: &Arc<AppState>, events: &[Event]) {
+    for ev in events {
+        publish_to_topics(&state.transport, ev).await;
+        state.hub.dispatch(ev);
     }
 }
 

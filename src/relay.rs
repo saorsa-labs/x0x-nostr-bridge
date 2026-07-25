@@ -565,6 +565,19 @@ async fn handle_event(
         return;
     }
 
+    // WP-B: the WS door executes group commands too. Buzz publishes over
+    // whichever door is wired, and a command that only materialized on the HTTP
+    // door would make channel creation depend on the client's transport choice.
+    if kinds::is_group_command(ev.kind.as_u16()) {
+        match crate::nip29::execute(state, &ev).await {
+            Ok(events) => crate::http::fan_out_group_state(state, &events).await,
+            Err(reason) => {
+                let _ = tx.send(RelayMessage::ok(ev.id, false, reason)).await;
+                return;
+            }
+        }
+    }
+
     match state.store.insert(&ev).await {
         Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
             publish_to_topics(&state.transport, &ev).await;

@@ -34,6 +34,41 @@ pub const KIND_MEMBERSHIP_LIST: u16 = 13534;
 /// Forum-post kind used by the NIP-50 search path alongside kind 9 (tests.md §4c).
 pub const KIND_FORUM_POST: u16 = 40002;
 
+/// NIP-29 add-user command (`e2eBridge.ts::handleAddChannelMembers`).
+pub const KIND_GROUP_ADD_USER: u16 = 9000;
+/// NIP-29 remove-user command (`handleRemoveChannelMember`).
+pub const KIND_GROUP_REMOVE_USER: u16 = 9001;
+/// NIP-29 edit-metadata command — also carries topic / purpose / archived
+/// (`handleUpdateChannel`, `handleSetChannelTopic`, `handleSetChannelPurpose`,
+/// `handleArchiveChannel`, `handleUnarchiveChannel`).
+pub const KIND_GROUP_EDIT_METADATA: u16 = 9002;
+/// NIP-29 create-group command (`handleCreateChannel`).
+pub const KIND_GROUP_CREATE: u16 = 9007;
+/// NIP-29 delete-group command (`handleDeleteChannel`).
+pub const KIND_GROUP_DELETE: u16 = 9008;
+/// NIP-29 join-request command (`handleJoinChannel`).
+pub const KIND_GROUP_JOIN_REQUEST: u16 = 9021;
+/// NIP-29 leave-request command (`handleLeaveChannel`).
+pub const KIND_GROUP_LEAVE_REQUEST: u16 = 9022;
+
+/// Client-submitted NIP-29 kinds the relay must **execute**, not merely store
+/// (dialect.md §7). Each materializes relay-authored 39000/39001/39002 that the
+/// client reads straight back — see [`crate::nip29`]. Kinds in the 9000..=9022
+/// band that Buzz never publishes are deliberately absent: an unrecognized
+/// command would otherwise be answered with a materialization we invented.
+pub fn is_group_command(kind: u16) -> bool {
+    matches!(
+        kind,
+        KIND_GROUP_ADD_USER
+            | KIND_GROUP_REMOVE_USER
+            | KIND_GROUP_EDIT_METADATA
+            | KIND_GROUP_CREATE
+            | KIND_GROUP_DELETE
+            | KIND_GROUP_JOIN_REQUEST
+            | KIND_GROUP_LEAVE_REQUEST
+    )
+}
+
 /// Depth cap for the `Some(meta)` thread branch (thread.md §1.4).
 pub const DEPTH_CAP: i64 = 100;
 /// Participant list cap in a 39005 summary (thread.md §1.5).

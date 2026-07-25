@@ -122,21 +122,17 @@ impl RelayIdentity {
         self.sign(kinds::KIND_WINDOW_BOUNDS, content, tags, now)
     }
 
-    /// Synthesize a relay-signed kind-39000 channel-metadata event (seed / WP4).
-    /// Tags include `["name", <name>]` so `assertRelaySeeded` matches.
-    pub fn channel_metadata_event(
+    /// Sign a relay-authored NIP-29 group-state replaceable (39000/39001/39002)
+    /// on behalf of the command executor ([`crate::nip29`]), which owns the tag
+    /// contract for each kind and therefore supplies the tags itself.
+    pub fn group_state_event(
         &self,
-        channel_id: &str,
-        name: &str,
+        kind: u16,
+        content: String,
+        tags: Vec<Tag>,
         now: u64,
     ) -> anyhow::Result<Event> {
-        let content = serde_json::json!({ "name": name }).to_string();
-        let tags = vec![
-            Tag::parse(["d", channel_id])?,
-            Tag::parse(["name", name])?,
-            Tag::parse(["h", channel_id])?,
-        ];
-        self.sign(kinds::KIND_CHANNEL_METADATA, content, tags, now)
+        self.sign(kind, content, tags, now)
     }
 
     /// Synthesize the relay-signed kind-13534 membership list (dialect.md §3).
