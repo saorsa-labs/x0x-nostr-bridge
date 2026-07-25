@@ -105,7 +105,7 @@ pub(crate) fn ingest_event(
         return Ok(match door {
             Door::Local => CoreOutcome::Rejected(reason),
             Door::Mesh => {
-                quarantine(tx, ev, &id, &reason, now)?;
+                quarantine(tx, ev, &id, QuarantineClass::RelayAuthored, &reason, now)?;
                 CoreOutcome::Quarantined(reason)
             }
         });
@@ -154,7 +154,14 @@ pub(crate) fn ingest_event(
                     ReplyResolution::Mismatch(reason) => Ok(match door {
                         Door::Local => CoreOutcome::Rejected(reason),
                         Door::Mesh => {
-                            quarantine(tx, ev, &id, &reason, now)?;
+                            quarantine(
+                                tx,
+                                ev,
+                                &id,
+                                QuarantineClass::AncestryMismatch,
+                                &reason,
+                                now,
+                            )?;
                             CoreOutcome::Quarantined(reason)
                         }
                     }),
@@ -526,6 +533,36 @@ fn delete_flow(
 
 // ---- mesh door: park / quarantine / drain ----------------------------------
 
+/// Why a mesh-door event was quarantined (kept, invisible, logged — design §4).
+/// The WARN message is built from this class: the previous hard-coded
+/// "ancestry mismatch" message also labelled relay-authored copies (e.g. a
+/// gossiped kind 39005), contradicting the accurate `reason` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineClass {
+    /// A mesh copy of a relay-authored kind: kept invisible so the bridge
+    /// never re-broadcasts relay state as if it were client content.
+    RelayAuthored,
+    /// A reply whose NIP-10 ancestry failed to resolve (root/channel/depth).
+    AncestryMismatch,
+}
+
+impl QuarantineClass {
+    /// Short label interpolated into the quarantine WARN message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::RelayAuthored => "relay-authored kind",
+            Self::AncestryMismatch => "ancestry mismatch",
+        }
+    }
+}
+
+/// The quarantine WARN message for `class`. Factored out of the
+/// `tracing::warn!` call so the per-class wording is pinned by unit tests — a
+/// hard-coded message mislabelled every non-ancestry quarantine.
+fn quarantine_message(class: QuarantineClass) -> String {
+    format!("mesh event quarantined ({})", class.label())
+}
+
 fn park(tx: &Transaction<'_>, ev: &Event, id: &str, parent: &str, now: i64) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO pending_orphans(event_id, parent_event_id, raw, received_at) \
@@ -541,7 +578,14 @@ fn park(tx: &Transaction<'_>, ev: &Event, id: &str, parent: &str, now: i64) -> R
     Ok(())
 }
 
-fn quarantine(tx: &Transaction<'_>, ev: &Event, id: &str, reason: &str, now: i64) -> Result<()> {
+fn quarantine(
+    tx: &Transaction<'_>,
+    ev: &Event,
+    id: &str,
+    class: QuarantineClass,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO quarantine(event_id, raw, reason, received_at) \
          VALUES(?1, ?2, ?3, ?4)",
@@ -551,7 +595,8 @@ fn quarantine(tx: &Transaction<'_>, ev: &Event, id: &str, reason: &str, now: i64
     tracing::warn!(
         event_id = id,
         reason = reason,
-        "mesh event quarantined (ancestry mismatch)"
+        "{}",
+        quarantine_message(class)
     );
     Ok(())
 }
@@ -598,7 +643,14 @@ fn drain_pending(
                             park(tx, &ev, &oid, &parent, now)?;
                         }
                         ReplyResolution::Mismatch(reason) => {
-                            quarantine(tx, &ev, &oid, &reason, now)?;
+                            quarantine(
+                                tx,
+                                &ev,
+                                &oid,
+                                QuarantineClass::AncestryMismatch,
+                                &reason,
+                                now,
+                            )?;
                         }
                         ReplyResolution::Ok(rr) => {
                             let emit = insert_reply(
@@ -836,4 +888,43 @@ fn resolve_markers(tags: &[Vec<String>]) -> Markers {
 fn derive_own_root(tags: &[Vec<String>], own_id: &str) -> String {
     let (root, reply) = scan_markers(tags);
     root.or(reply).unwrap_or_else(|| own_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The WARN message must name the ACTUAL quarantine class: every
+    /// relay-authored gossip copy was previously logged as "ancestry
+    /// mismatch", contradicting the accurate `reason` field next to it
+    /// (observed live: `reason="invalid: kind 39005 is relay-authored"`
+    /// under an "ancestry mismatch" message).
+    #[test]
+    fn quarantine_message_reflects_class() {
+        let relay = quarantine_message(QuarantineClass::RelayAuthored);
+        assert!(relay.contains("relay-authored"), "got: {relay}");
+        assert!(
+            !relay.contains("ancestry mismatch"),
+            "relay-authored quarantine mislabelled: {relay}"
+        );
+
+        let ancestry = quarantine_message(QuarantineClass::AncestryMismatch);
+        assert!(ancestry.contains("ancestry mismatch"), "got: {ancestry}");
+
+        assert_ne!(relay, ancestry, "classes must log distinct messages");
+    }
+
+    /// The class labels are the human-readable contract of the WARN line;
+    /// pin them so a wording change is a deliberate, reviewed act.
+    #[test]
+    fn quarantine_class_labels() {
+        assert_eq!(
+            QuarantineClass::RelayAuthored.label(),
+            "relay-authored kind"
+        );
+        assert_eq!(
+            QuarantineClass::AncestryMismatch.label(),
+            "ancestry mismatch"
+        );
+    }
 }

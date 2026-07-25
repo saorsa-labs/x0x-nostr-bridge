@@ -352,6 +352,44 @@ async fn v10_client_overlay_kinds_rejected() {
     }
 }
 
+/// The mesh-door half of V10: a relay-authored kind arriving over gossip is
+/// QUARANTINED (kept, invisible), not rejected — and its recorded reason must
+/// say "relay-authored", not "ancestry mismatch". This pins the call-site
+/// half of the quarantine-reason distinction (the log-message half is pinned
+/// by the `quarantine_message` unit tests in `history::engine`).
+#[tokio::test]
+async fn v10_mesh_relay_authored_kind_quarantined_with_honest_reason() {
+    let s = store();
+    let a = Keys::generate();
+    let spoof_summary = build(&a, 39005, "{\"reply_count\":999}", 1000, vec![h(CH)]);
+
+    match s.ingest_mesh(&spoof_summary).await.expect("ingest_mesh") {
+        MeshIngest::Quarantined(r) => {
+            assert!(r.contains("relay-authored"), "reason was: {r}");
+            assert!(
+                !r.contains("ancestry"),
+                "relay-authored quarantine mislabelled as ancestry: {r}"
+            );
+        }
+        other => panic!("expected Quarantined, got {other:?}"),
+    }
+
+    // Quarantined means invisible to the served surface: a kind-9 message in
+    // the same channel is served, the spoofed 39005 is not.
+    let visible = msg(&a, "real message", 1001, vec![]);
+    match s.ingest_mesh(&visible).await.expect("ingest_mesh") {
+        MeshIngest::Accepted(_) => {}
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+    let window = s.channel_window(CH, 50, None).await.unwrap();
+    let served: Vec<String> = window.rows.iter().map(|e| e.id.to_hex()).collect();
+    assert!(served.contains(&visible.id.to_hex()));
+    assert!(
+        !served.contains(&spoof_summary.id.to_hex()),
+        "quarantined relay-authored spoof must be invisible"
+    );
+}
+
 // ---- V11 -------------------------------------------------------------------
 
 #[tokio::test]
