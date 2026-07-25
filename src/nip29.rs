@@ -22,7 +22,7 @@
 //! |---------------------------|--------------------------------------------------|
 //! | `["d", id]`               | list mapper `getTag("d")` → `RawChannel.id`       |
 //! | `["name", s]`             | `getTag("name")`                                  |
-//! | `["about", s]`            | `getTag("about")` → `description`                 |
+//! | `["about", s]`            | `getTag("about")` → `description` (always emitted)|
 //! | `["t", s]`                | `getTag("t")` → `channel_type` (default `stream`) |
 //! | `["visibility", s]`       | `handleUpdateChannel` `getTag("visibility")`      |
 //! | `["private", "true"]`     | list mapper / details `tags.some(t[0]=="private")` |
@@ -41,8 +41,21 @@
 //! `handleListChannels` resolves *its own* membership with `{kinds:[39002],
 //! "#p":[mypubkey]}`, so the `p` tags are also the client's `is_member` source.
 //!
+//! Absent and empty are **not** interchangeable here. `RawChannel.description`
+//! is typed `string`, while `topic` and `purpose` are `string | null`; the
+//! relay read-backs coalesce a missing tag to `null` for all three, so only the
+//! two that are declared nullable may be left off. See `ChannelMeta::to_tags`.
+//!
 //! kind-39001 (admins) is not read by the client; it is the durable home for
 //! the "who may moderate this channel" answer that `is_authorized` needs.
+//!
+//! ## One builder, two callers
+//!
+//! The demo seed ([`crate::seed`]) materializes its channels through
+//! `seed_channel` rather than hand-building tags, so a seeded channel and a
+//! command-created one cannot drift apart. They did drift once: the seed's
+//! 39000 carried only `d`/`name`/`h`, which typed the seeded DM as a `stream`
+//! and left `general` with no description.
 //!
 //! ## Why the executor re-reads state instead of accumulating it
 //!
@@ -278,6 +291,51 @@ async fn is_authorized(
     }
 }
 
+/// Materialize a channel the relay owns outright — the demo seed — through the
+/// same 39000/39002 builders a client command goes through.
+///
+/// Emits the metadata and the membership list, but deliberately **no** 39001:
+/// a seeded channel has no creator to make admin, and [`is_authorized`] already
+/// falls back to the engine's membership table for channels with no admin list.
+///
+/// `members` are recorded as plain `member`s. The 39002 is not optional
+/// bookkeeping: `handleListChannels` resolves its own membership with
+/// `{kinds:[39002],"#p":[mypubkey]}` and `AppShell` filters the sidebar on the
+/// resulting `isMember`, so a seeded channel with no 39002 is invisible.
+pub(crate) async fn seed_channel(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    channel_type: &str,
+    private: bool,
+    members: &[String],
+) -> Result<Vec<Event>, String> {
+    let meta = ChannelMeta {
+        id: id.to_string(),
+        name: name.to_string(),
+        about: None,
+        channel_type: channel_type.to_string(),
+        private,
+        topic: None,
+        purpose: None,
+        ttl: None,
+        archived: false,
+        deleted: false,
+    };
+    let mut set = MemberSet::default();
+    for pk in members {
+        set.upsert(pk, "member");
+    }
+    let out = vec![
+        emit_meta(state, &meta, None).await?,
+        emit_members(state, id, &set, None).await?,
+    ];
+    for pk in members {
+        seed_member(state, id, pk).await;
+    }
+    Ok(out)
+}
+
 /// Mirror an addition into the engine's membership table so the (default-off)
 /// membership gate agrees with the 39002 the client reads. Best-effort: the
 /// 39002 event is the client-visible authority, and the trait exposes no
@@ -331,12 +389,22 @@ impl ChannelMeta {
                 "visibility".into(),
                 if self.private { "private" } else { "open" }.into(),
             ],
+            // `about` is emitted even when empty, unlike every other optional
+            // tag below. `RawChannel.description` is typed `string`, not
+            // `string | null`, and the client's own mock path honours that
+            // (`args.description ?? ""`) — but the *relay* read-backs do
+            // `getTag("about") ?? null` (`handleCreateChannel`,
+            // `handleUpdateChannel`, `handleGetChannelDetails`), so an absent
+            // tag hands the UI a null it dereferences unconditionally
+            // (`channel.description.trim()`) and the render throws. Absent and
+            // empty are therefore not the same thing to this client. `topic`
+            // and `purpose` are genuinely `string | null` and stay absent.
+            vec!["about".into(), self.about.clone().unwrap_or_default()],
         ];
         if self.private {
             raw.push(vec!["private".into(), "true".into()]);
         }
         for (name, value) in [
-            ("about", &self.about),
             ("topic", &self.topic),
             ("purpose", &self.purpose),
             ("ttl", &self.ttl),

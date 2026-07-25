@@ -18,6 +18,10 @@
 //! single-letter tags (gate-report defect 1, owned by `wp-tagfilter`), and an
 //! unmodelled dimension currently *widens* the query. Once that lands these can
 //! use `#d` directly, which is also what the client sends.
+//!
+//! The demo seed materializes its channels through the same builder, so its
+//! 39000/39002 are covered here too rather than in a separate file — the whole
+//! point of sharing the builder is that one contract governs both.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -750,5 +754,168 @@ async fn a_malformed_command_is_rejected_with_a_reason_and_stored_nowhere() {
     assert!(
         stored.is_empty(),
         "a rejected command must not reach the store: {stored:?}"
+    );
+}
+
+/// `RawChannel.description` is typed `string`, not `string | null`, and the
+/// client's own mock path honours that with `args.description ?? ""`. But the
+/// relay read-backs (`handleCreateChannel`, `handleUpdateChannel`,
+/// `handleGetChannelDetails`) all coalesce a missing tag to `null`, and the ⌘K
+/// result renderer then does `channel.description.trim()` unconditionally. So an
+/// absent `about` is not "no description", it is a TypeError and a React error
+/// boundary — absent and empty are observably different to this client.
+#[tokio::test]
+async fn a_channel_created_without_a_description_still_carries_an_empty_about() {
+    let (addr, state) = spawn_real().await;
+    let owner = Keys::generate();
+    let id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    // Exactly what handleCreateChannel sends when the user leaves the
+    // description blank: no `about` tag at all.
+    command(
+        addr,
+        &owner,
+        9007,
+        &[
+            &["h", id],
+            &["name", "no-description"],
+            &["channel_type", "stream"],
+            &["visibility", "open"],
+        ],
+    )
+    .await;
+
+    let meta = addressable(&state, KIND_META, id).await.unwrap();
+    assert!(
+        has_tag(&meta, "about"),
+        "an absent about tag makes getTag(\"about\") ?? null yield null, \
+         which the ⌘K renderer dereferences with .trim()"
+    );
+    assert_eq!(
+        tag(&meta, "about").as_deref(),
+        Some(""),
+        "the empty description must be carried as an empty value, not omitted"
+    );
+
+    // `topic` and `purpose` are declared `string | null`, so their absence is
+    // meaningful and must NOT be papered over the same way.
+    assert!(
+        !has_tag(&meta, "topic") && !has_tag(&meta, "purpose"),
+        "nullable fields stay absent; only `description` is typed non-null"
+    );
+    // Same for `private`, which the list mapper reads by presence alone.
+    assert!(!has_tag(&meta, "private"));
+}
+
+/// An edit that never mentions `about` must not drop it either — the tag has to
+/// survive every 9002 path, not just the create path.
+#[tokio::test]
+async fn about_survives_an_unrelated_edit() {
+    let (addr, state) = spawn_real().await;
+    let owner = Keys::generate();
+    let id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+    command(
+        addr,
+        &owner,
+        9007,
+        &[
+            &["h", id],
+            &["name", "topical"],
+            &["channel_type", "stream"],
+            &["visibility", "open"],
+        ],
+    )
+    .await;
+    command(addr, &owner, 9002, &[&["h", id], &["topic", "anything"]]).await;
+
+    let meta = addressable(&state, KIND_META, id).await.unwrap();
+    assert_eq!(tag(&meta, "about").as_deref(), Some(""));
+}
+
+/// The seed used to hand-build its 39000 with only `d`/`name`/`h`. Routing it
+/// through the executor's builder is what stops the two drifting apart again,
+/// so this asserts the seeded channels satisfy the same client contract as a
+/// command-created one.
+#[tokio::test]
+async fn seeded_channels_satisfy_the_same_39000_contract() {
+    let (_addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+
+    let general = addressable(&state, KIND_META, "general")
+        .await
+        .expect("assertRelaySeeded polls for this 39000");
+    assert_eq!(tag(&general, "name").as_deref(), Some("general"));
+    assert_eq!(
+        tag(&general, "t").as_deref(),
+        Some("stream"),
+        "an absent t tag types the channel from a default rather than the relay"
+    );
+    assert_eq!(tag(&general, "visibility").as_deref(), Some("open"));
+    assert!(!has_tag(&general, "private"), "general is an open channel");
+    assert_eq!(
+        tag(&general, "about").as_deref(),
+        Some(""),
+        "the seeded channel is subject to the same non-null description contract"
+    );
+}
+
+/// `handleListChannels` types a channel from `getTag("t") ?? "stream"`, so a DM
+/// with no `t` tag is indistinguishable from a stream — it misses every
+/// dm-specific render path. And the sidebar (`AppShell`) filters on `isMember`,
+/// which the client resolves from `{kinds:[39002],"#p":[mypubkey]}`, so the DM
+/// also needs a 39002 naming its two participants or it never appears at all.
+#[tokio::test]
+async fn the_seeded_dm_is_typed_dm_and_has_a_membership_list() {
+    let (_addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+    let dm_id = x0x_nostr_bridge::seed::dm_channel_id("alice-tyler");
+
+    let dm = addressable(&state, KIND_META, &dm_id)
+        .await
+        .expect("the DM channel must be materialized");
+    assert_eq!(
+        tag(&dm, "t").as_deref(),
+        Some("dm"),
+        "without this the client types the DM as a stream"
+    );
+    assert_eq!(tag(&dm, "name").as_deref(), Some("alice-tyler"));
+    assert_eq!(tag(&dm, "about").as_deref(), Some(""));
+    assert!(
+        has_tag(&dm, "private"),
+        "a DM is not browsable; the list mapper reads visibility off this tag"
+    );
+    assert_eq!(tag(&dm, "visibility").as_deref(), Some("private"));
+
+    // tyler and alice, the two identities the DM id is derived from.
+    let members = addressable(&state, KIND_MEMBERS, &dm_id)
+        .await
+        .expect("no 39002 means isMember false means no sidebar row");
+    let seeded: Vec<String> = x0x_nostr_bridge::seed::TEST_MEMBERS[..2]
+        .iter()
+        .map(|(_, pk)| (*pk).to_string())
+        .collect();
+    assert_eq!(p_pubkeys(&members), seeded);
+}
+
+/// Every seeded member must resolve as a member of `general`, for the same
+/// sidebar reason — the 13534 membership list the seed also emits is a separate
+/// NIP-43 surface the channel list does not consult.
+#[tokio::test]
+async fn seeded_general_has_a_39002_for_every_test_member() {
+    let (_addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+
+    let members = addressable(&state, KIND_MEMBERS, "general")
+        .await
+        .expect("general needs a 39002 or every seeded identity sees an empty sidebar");
+    let expected: Vec<String> = x0x_nostr_bridge::seed::TEST_MEMBERS
+        .iter()
+        .map(|(_, pk)| (*pk).to_string())
+        .collect();
+    assert_eq!(p_pubkeys(&members), expected);
+    assert_eq!(
+        all_addressable(&state, KIND_MEMBERS, "general").await.len(),
+        1
     );
 }

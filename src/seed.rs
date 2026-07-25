@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::engine_api::Visibility;
+use crate::nip29;
 use crate::relay::AppState;
 use crate::relay_identity::now_secs;
 
@@ -47,42 +47,42 @@ pub fn dm_channel_id(name: &str) -> String {
 /// `Duplicate` (no error).
 pub async fn seed_demo(state: &Arc<AppState>) -> anyhow::Result<()> {
     let now = now_secs();
-
-    // general channel metadata (relay-signed 39000).
-    let general = state
-        .identity
-        .channel_metadata_event("general", "general", now)?;
-    state.engine.seed_event(&general).await?;
-    state
-        .engine
-        .seed_visibility("general", Visibility::Open)
-        .await?;
-
-    // members.
     let member_pubkeys: Vec<String> = TEST_MEMBERS.iter().map(|(_, pk)| pk.to_string()).collect();
-    for pk in &member_pubkeys {
-        state.engine.seed_member("general", pk).await?;
-    }
 
-    // relay-signed 13534 membership list for `general`.
+    // `general` — 39000 + 39002, built by the same code path a kind-9007
+    // create goes through (`nip29::seed_channel`). Hand-rolling the tags here
+    // is what let the seed drift out of the client's contract: it used to emit
+    // only `d`/`name`/`h`, leaving `general` with no description and typing
+    // the DM below as a `stream`.
+    nip29::seed_channel(
+        state,
+        "general",
+        "general",
+        "stream",
+        false,
+        &member_pubkeys,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("seeding general failed: {e}"))?;
+
+    // relay-signed 13534 membership list for `general` (dialect.md §3). This is
+    // a separate NIP-43 surface from the 39002 above, not a duplicate of it.
     let list = state
         .identity
         .membership_list_event("general", &member_pubkeys, now)?;
     state.engine.seed_event(&list).await?;
 
-    // alice-tyler DM channel.
+    // alice-tyler DM channel. `["t","dm"]` is load-bearing: the client types a
+    // channel from `getTag("t") ?? "stream"`, and a DM mistyped as a stream
+    // misses the dm-specific render paths entirely.
     let dm_id = dm_channel_id("alice-tyler");
-    let dm = state
-        .identity
-        .channel_metadata_event(&dm_id, "alice-tyler", now)?;
-    state.engine.seed_event(&dm).await?;
-    state
-        .engine
-        .seed_visibility(&dm_id, Visibility::Closed)
-        .await?;
-    for (_, pk) in &[TEST_MEMBERS[0], TEST_MEMBERS[1]] {
-        state.engine.seed_member(&dm_id, pk).await?;
-    }
+    let dm_members: Vec<String> = [TEST_MEMBERS[0], TEST_MEMBERS[1]]
+        .iter()
+        .map(|(_, pk)| pk.to_string())
+        .collect();
+    nip29::seed_channel(state, &dm_id, "alice-tyler", "dm", true, &dm_members)
+        .await
+        .map_err(|e| anyhow::anyhow!("seeding dm failed: {e}"))?;
 
     tracing::info!(dm_channel = %dm_id, "demo seed complete (general + members + DM)");
     Ok(())
