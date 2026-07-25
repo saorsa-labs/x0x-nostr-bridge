@@ -186,9 +186,21 @@ replaceable on `d=root`); kind-13534 membership list emission. Stretch: 1012
 drain on SIGTERM + 503 during drain (contract known, spec not in gate).
 
 **WP4 — seed + gate harness**:
-`--seed-demo` (or config): `general` channel kind-39000 (tags incl.
-`["name","general"]`), members tyler/alice/bob/charlie (pubkeys in tests.md
-§3), DM channel `alice-tyler` id = `uuid5(DNS,"buzz.channel.dm.alice-tyler")`;
+`--seed-demo` (or config): four channels — `general` (stream), `random`
+(stream), `watercooler` (forum) and the `alice-tyler` DM — each a kind-39000
+(tags incl. `["name",…]`) plus a kind-39002 naming its members;
+members tyler/alice/bob/charlie (pubkeys in tests.md §3), the DM being
+tyler+alice only.
+
+**Every seeded channel id is uuid5-derived**, not just the DM:
+`uuid5(DNS,"buzz.channel.<name>")` for a normal channel and
+`uuid5(DNS,"buzz.channel.dm.<name>")` for a DM. This rule was previously stated
+for the DM alone, and `general` was seeded as the literal string `"general"` —
+which put every row the specs seed into a channel the client never opens, since
+`parity-ancestor-island.spec.ts:33-34` addresses it as
+`9f28288a-d724-587a-9709-92dc7f967110` = `uuid5(DNS,"buzz.channel.general")`.
+The bridge accepts events for an `h` channel that does not exist, so a
+mis-keyed seed fails silently rather than loudly;
 Host acceptance for `localhost:3000` (any Host in single-community mode);
 tic-tac-toe justfile recipe `bridge-gate`: build bridge, launch x0xd
 (isolated config, `[update] enabled=false`, no prod bootstraps) + bridge,

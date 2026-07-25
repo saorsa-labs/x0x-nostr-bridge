@@ -464,10 +464,12 @@ async fn window_response(state: &Arc<AppState>, raw: &Value, caller: &str) -> Re
             }
         }
     }
-    // 4. exactly one relay-signed 39006 window-bounds overlay.
+    // 4. exactly one relay-signed 39006 window-bounds overlay. Its `d` echoes
+    // the cursor this request carried — it is the client's correlation key, not
+    // the address of the next page (that is `content.next_cursor`).
     match state
         .identity
-        .window_bounds_event(&channel, &window.bounds, now)
+        .window_bounds_event(&channel, q.cursor.as_ref(), &window.bounds, now)
     {
         Ok(bounds) => out.push(event_to_value(&bounds)),
         Err(e) => {

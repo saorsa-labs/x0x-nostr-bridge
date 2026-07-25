@@ -94,10 +94,22 @@ For a `top_level` request the relay appends, in this order (`bridge.rs:~470-585`
    per row that has replies. `content` = `{reply_count, descendant_count, last_reply_at,
    participants:[hex...]}`; tags `["e",root],["d",root],["h",channel]`.
 4. **Window-bounds overlay**: **exactly one relay-signed synthetic kind 39006** — the sole authority
-   on exhaustion. `content` = `{"has_more": bool, "next_cursor": {"created_at": secs, "id": hex} | null}`;
-   `d` tag = `"{channel}:{ts}:{id}"` or `"{channel}:head"`. The client reads `next_cursor` from this
-   event to build the next page's `until`+`before_id`. **`rows < limit` proves nothing** — the final
-   exact-multiple page still needs the 39006 to say `has_more:false`.
+   on exhaustion. `content` = `{"has_more": bool, "next_cursor": {"created_at": secs, "id": hex} | null}`.
+   The client reads `next_cursor` from this event to build the next page's `until`+`before_id`.
+   **`rows < limit` proves nothing** — the final exact-multiple page still needs the 39006 to say
+   `has_more:false`.
+
+   The `d` tag is the response's **correlation key, not the next page's address**: it echoes the
+   cursor the client **sent**, so `d` = `"{channel}:{until}:{before_id}"` for a cursor request and
+   `"{channel}:head"` for a cursorless one. Both halves are lower-cased. The client rebuilds the
+   same string from its own request (`expectedBoundsKey`, `channelWindowResponse.ts:74-82`) and
+   **hard-fails the whole page** on a mismatch (`:116-120`).
+
+   > This paragraph previously gave the format without saying *which* cursor, and the bridge
+   > resolved the ambiguity to `next_cursor`. The two spellings agree only for a head request with
+   > `has_more:false` — i.e. any channel that fits in one window — so every larger channel rendered
+   > an empty timeline and never paginated, silently. Buzz's own reference relay for mock mode keys
+   > on the request cursor (`e2eBridge.ts:4440-4451`); that is the contract.
 
 Non-window paths (feed/thread/catchall) and search return the same bare-array shape but without the
 39005/39006 overlays. Presence filters (kinds = only `KIND_PRESENCE_UPDATE`/`_SNAPSHOT`) are

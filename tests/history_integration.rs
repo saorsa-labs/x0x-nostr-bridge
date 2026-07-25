@@ -126,14 +126,15 @@ async fn seed_39000_served_from_real_store() {
 
 /// The M1a gate failure, end to end over `/query`. Buzz resolves an addressable
 /// (NIP-33/NIP-29) channel with `{kinds:[39000], "#d":[id], limit:1}`. The seed
-/// stores TWO 39000s (`general` + the alice-tyler DM), so a bridge that drops
-/// `#d` hands back `general` for both lookups — the client takes row `[0]`,
-/// finds no `about` tag, and `channel.description.trim()` throws.
+/// stores one 39000 per seeded channel, so a bridge that drops `#d` hands back
+/// whichever row sorts first for every lookup — the client takes row `[0]` and
+/// renders the wrong channel.
 #[tokio::test]
 async fn addressable_d_query_resolves_the_right_channel() {
     let (addr, state) = spawn_real().await;
     x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
     let dm_id = x0x_nostr_bridge::seed::dm_channel_id("alice-tyler");
+    let general_id = x0x_nostr_bridge::seed::channel_id("general");
 
     let d_tag_of = |e: &Value| {
         e["tags"]
@@ -143,7 +144,7 @@ async fn addressable_d_query_resolves_the_right_channel() {
             .unwrap()
     };
 
-    for want in [dm_id.as_str(), "general"] {
+    for want in [dm_id.as_str(), general_id.as_str()] {
         let arr = query(
             addr,
             TYLER,
@@ -338,4 +339,95 @@ async fn known_channels_lists_channel_after_ingest() {
         chans.iter().any(|c| c == "general"),
         "known_channels lists the channel after an event is stored"
     );
+}
+
+/// Extract the single kind-39006 bounds overlay from a window response.
+fn bounds_of(arr: &[Value]) -> &Value {
+    let b: Vec<&Value> = arr.iter().filter(|e| e["kind"] == 39006).collect();
+    assert_eq!(b.len(), 1, "exactly one 39006 per window response");
+    b[0]
+}
+
+fn d_of(ev: &Value) -> String {
+    ev["tags"]
+        .as_array()
+        .and_then(|t| t.iter().find(|tag| tag[0] == "d"))
+        .and_then(|tag| tag[1].as_str().map(str::to_string))
+        .unwrap()
+}
+
+/// The 39006 `d` tag is the response's **correlation key**: the client rebuilds
+/// it from the cursor it sent (`expectedBoundsKey`,
+/// `channelWindowResponse.ts:74-82`) and throws the entire page away on a
+/// mismatch (`:116-120`). Keying it off `next_cursor` instead agrees only for a
+/// head request with no second page — so it looked correct for every channel
+/// that fits in one window, and every larger channel rendered empty and never
+/// paginated, with the error swallowed by React Query.
+///
+/// This drives both pages over HTTP because the defect had two halves: the
+/// builder used the wrong cursor, and `POST /query` never passed the request
+/// cursor in at all. A unit test on the builder alone would still have passed
+/// with the second half unfixed.
+#[tokio::test]
+async fn window_bounds_d_echoes_the_request_cursor_across_two_pages() {
+    let (addr, _state) = spawn_real().await;
+    let author = Keys::generate();
+    let pubkey = author.public_key().to_hex();
+    let channel = "paging-channel";
+
+    // 60 top-level rows against a limit of 50 — i.e. two pages.
+    for i in 0..60 {
+        let ev = kind9(&author, channel, &format!("row {i}"), vec![]);
+        assert_eq!(post_event(addr, &ev, &pubkey).await.status(), 200);
+    }
+
+    let window = json!([{ "#h": [channel], "kinds": [9], "top_level": true,
+                          "include_summaries": true, "include_aux": true, "limit": 50 }]);
+    let page1 = query(addr, &pubkey, window).await;
+    let page1 = page1.as_array().unwrap();
+    let b1 = bounds_of(page1);
+
+    // The head request carries no cursor, so the key is `:head` — even though a
+    // second page exists. This exact pair is what the old keying got wrong.
+    assert_eq!(
+        d_of(b1),
+        format!("{channel}:head"),
+        "a head request must be answered with the head key regardless of has_more"
+    );
+    let content: Value = serde_json::from_str(b1["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["has_more"], true, "60 rows over a limit of 50");
+    let next = &content["next_cursor"];
+    assert!(
+        !next.is_null(),
+        "the next page's address belongs in content, and the client needs it to paginate"
+    );
+
+    // Page two: send that cursor back. The key must echo what we sent, not the
+    // cursor this response returns.
+    let (until, before_id) = (
+        next["created_at"].as_u64().unwrap(),
+        next["id"].as_str().unwrap().to_string(),
+    );
+    let page2 = query(
+        addr,
+        &pubkey,
+        json!([{ "#h": [channel], "kinds": [9], "top_level": true,
+                 "include_summaries": true, "include_aux": true, "limit": 50,
+                 "until": until, "before_id": before_id }]),
+    )
+    .await;
+    let page2 = page2.as_array().unwrap();
+    let b2 = bounds_of(page2);
+    assert_eq!(
+        d_of(b2),
+        format!("{channel}:{until}:{before_id}"),
+        "page two must be keyed on the cursor the client sent"
+    );
+
+    // And the rows actually advanced, so this is a real second page.
+    let rows2: Vec<&Value> = page2.iter().filter(|e| e["kind"] == 9).collect();
+    assert_eq!(rows2.len(), 10, "60 rows, 50 on page one");
+    let content2: Value = serde_json::from_str(b2["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content2["has_more"], false);
+    assert!(content2["next_cursor"].is_null());
 }
