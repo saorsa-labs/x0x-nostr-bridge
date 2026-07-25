@@ -42,7 +42,7 @@
 //! "#p":[mypubkey]}`, so the `p` tags are also the client's `is_member` source.
 //!
 //! kind-39001 (admins) is not read by the client; it is the durable home for
-//! the "who may moderate this channel" answer that [`is_authorized`] needs.
+//! the "who may moderate this channel" answer that `is_authorized` needs.
 //!
 //! ## Why the executor re-reads state instead of accumulating it
 //!
@@ -54,6 +54,7 @@
 
 use nostr::{Event, Filter, Kind, Tag};
 
+use crate::engine_api::Visibility;
 use crate::kinds;
 use crate::relay::AppState;
 use crate::relay_identity::now_secs;
@@ -386,6 +387,20 @@ async fn emit_meta(
     meta: &ChannelMeta,
     prev: Option<&Event>,
 ) -> Result<Event, String> {
+    // Mirror visibility into the engine for the same reason `seed_member`
+    // exists: the (default-off) membership gate reads `visibility`, and a
+    // channel the client shows as private must not be gated as open. Every
+    // meta-mutating path funnels through here, so an edit that flips
+    // `visibility` moves the gate with it. Best-effort — the 39000 is the
+    // client-visible authority.
+    let vis = if meta.private {
+        Visibility::Closed
+    } else {
+        Visibility::Open
+    };
+    if let Err(e) = state.engine.seed_visibility(&meta.id, vis).await {
+        tracing::debug!(error = %e, channel_id = %meta.id, "seed_visibility mirror failed");
+    }
     // Content mirrors the seed's 39000 so seeded and command-created channels
     // are byte-shaped alike.
     let content = serde_json::json!({ "name": meta.name }).to_string();

@@ -188,6 +188,9 @@ pub async fn post_events(
     if kinds::is_group_command(ev.kind.as_u16()) {
         match nip29::execute(&state, &ev).await {
             Ok(events) => fan_out_group_state(&state, &events).await,
+            // A moderation refusal is an authorization outcome, not a malformed
+            // request — same 403 the membership gate above returns.
+            Err(reason) if reason.starts_with("restricted:") => return api_error(403, &reason),
             Err(reason) => return api_error(400, &reason),
         }
     }
