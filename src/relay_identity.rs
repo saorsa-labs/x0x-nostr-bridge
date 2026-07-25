@@ -139,6 +139,19 @@ impl RelayIdentity {
         self.sign(kinds::KIND_CHANNEL_METADATA, content, tags, now)
     }
 
+    /// Sign a relay-authored NIP-29 group-state replaceable (39000/39001/39002)
+    /// on behalf of the command executor ([`crate::nip29`]), which owns the tag
+    /// contract for each kind and therefore supplies the tags itself.
+    pub fn group_state_event(
+        &self,
+        kind: u16,
+        content: String,
+        tags: Vec<Tag>,
+        now: u64,
+    ) -> anyhow::Result<Event> {
+        self.sign(kind, content, tags, now)
+    }
+
     /// Synthesize the relay-signed kind-13534 membership list (dialect.md §3).
     /// A single replaceable event; members carried as `["p", <hex>]` tags.
     pub fn membership_list_event(

@@ -15,6 +15,7 @@ pub mod http;
 pub mod ingest;
 pub mod kinds;
 pub mod nip11;
+pub mod nip29;
 pub mod proto;
 pub mod rate_limit;
 pub mod relay;
