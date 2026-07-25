@@ -107,6 +107,7 @@ struct BridgeGuard {
     addr: String,
     name: String,
     log_path: PathBuf,
+    db_path: PathBuf,
     _db_dir: tempfile::TempDir,
 }
 
@@ -155,7 +156,9 @@ fn spawn_bridge(daemon: &AgentInstance, name: &str) -> BridgeGuard {
         .env("BRIDGE_PUBLIC_URL", format!("http://{addr}"))
         .env("X0X_API", format!("http://{}", daemon.api_addr))
         .env("X0X_TOKEN", &daemon.api_token)
-        .env("RUST_LOG", "info")
+        // ingest=debug: the mesh-duplicate line is the positive evidence that
+        // a redelivered payload REACHED the bridge and was deduped there.
+        .env("RUST_LOG", "info,x0x_nostr_bridge::ingest=debug")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -173,6 +176,7 @@ fn spawn_bridge(daemon: &AgentInstance, name: &str) -> BridgeGuard {
         addr,
         name: name.to_string(),
         log_path,
+        db_path,
         _db_dir: db_dir,
     }
 }
@@ -558,4 +562,464 @@ async fn e2e_single_bridge_global_history_roundtrip() {
         }
     }
     println!("SMOKE OK: global publish + echo store + REQ history round-trip on one bridge");
+}
+
+// ---------------------------------------------------------------------------
+// WP5 property proofs (mesh-door parking; redelivery idempotence)
+// ---------------------------------------------------------------------------
+
+/// Publish raw bytes to a gossip topic directly through a daemon's REST API —
+/// the same `POST /publish` the bridge's transport uses, driven by the test so
+/// delivery ORDER is deterministic (reply-before-parent, redelivery).
+async fn daemon_publish(daemon: &AgentInstance, topic: &str, payload: &[u8]) {
+    use base64::Engine as _;
+    let body = serde_json::json!({
+        "topic": topic,
+        "payload": base64::engine::general_purpose::STANDARD.encode(payload),
+    });
+    let resp = daemon.post("/publish", body).await;
+    assert!(
+        resp.status().is_success(),
+        "daemon /publish to {topic} failed: HTTP {}",
+        resp.status()
+    );
+}
+
+/// Subscribe a daemon to a topic directly (`POST /subscribe`), so publishes
+/// through that daemon propagate on a topic its bridge never joined.
+async fn daemon_subscribe(daemon: &AgentInstance, topic: &str) {
+    let resp = daemon
+        .post("/subscribe", serde_json::json!({ "topic": topic }))
+        .await;
+    assert!(
+        resp.status().is_success(),
+        "daemon /subscribe to {topic} failed: HTTP {}",
+        resp.status()
+    );
+}
+
+/// One read-only query against a bridge's live SQLite (WAL: a concurrent
+/// reader is fine). Returns the count for `sql` with `param` bound to ?1.
+fn db_count(db: &PathBuf, sql: &str, param: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("open bridge db");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    conn.query_row(sql, [param], |r| r.get::<_, i64>(0))
+        .expect("count query")
+}
+
+/// Poll `cond` against the bridge DB until it holds or the deadline passes.
+/// Gossip delivery is async; assertions on durable state must tolerate that.
+async fn await_db(
+    db: &PathBuf,
+    label: &str,
+    timeout: Duration,
+    cond: impl Fn(&PathBuf) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond(db) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{label}] DB condition not met within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Assert that no live EVENT frame carrying `ev_id` arrives on the socket
+/// within `window` (any other frame is drained and ignored). Used to prove a
+/// redelivered duplicate does NOT fan out a second time.
+async fn assert_no_live_event(ws: &mut WS, ev_id: &str, window: Duration, label: &str) {
+    let deadline = Instant::now() + window;
+    loop {
+        let rem = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if rem.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(rem, next_text(ws)).await {
+            Ok(v) => {
+                assert!(
+                    !(str_at(&v, 0) == Some("EVENT") && event_id_of(&v) == Some(ev_id)),
+                    "[{label}] duplicate live fan-out of {ev_id}: {v}"
+                );
+            }
+            Err(_) => return, // window elapsed with no further frames
+        }
+    }
+}
+
+/// Collect every EVENT id served on subscription `sub` before its EOSE.
+async fn history_ids_until_eose(ws: &mut WS, sub: &str, deadline: Instant) -> Vec<String> {
+    let mut ids = Vec::new();
+    loop {
+        let rem = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        let v = tokio::time::timeout(rem, next_text(ws))
+            .await
+            .expect("history EOSE timeout");
+        if str_at(&v, 0) == Some("EOSE") && str_at(&v, 1) == Some(sub) {
+            return ids;
+        }
+        if str_at(&v, 0) == Some("EVENT") && str_at(&v, 1) == Some(sub) {
+            if let Some(id) = event_id_of(&v) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+}
+
+/// Signed kind-9 reply to `root_id` with the marked NIP-10 tags the thread
+/// engine requires (`["e",root,"","root"]` + `["e",root,"","reply"]`).
+fn signed_reply(keys: &Keys, channel: &str, root_id: &str, content: &str) -> nostr::Event {
+    EventBuilder::new(Kind::from(9u16), content)
+        .tag(Tag::custom(TagKind::custom("h"), [channel]))
+        .tag(Tag::custom(TagKind::custom("e"), [root_id, "", "root"]))
+        .tag(Tag::custom(TagKind::custom("e"), [root_id, "", "reply"]))
+        .sign_with_keys(keys)
+        .expect("sign reply")
+}
+
+/// WP5 property 2 — mesh-door events route through WP1 parking (design D2).
+///
+/// A reply is injected onto the channel topic BEFORE its root. On bridge B it
+/// must PARK (invisible: not served, not dispatched, held in pending_orphans),
+/// then — when the root lands — attach atomically and recompute the thread
+/// counters. Every step is asserted against B's live SQLite and its REQ
+/// surface, not log lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires spawning real x0xd daemons"]
+async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
+    let _g = suite_lock().await;
+    ensure_x0xd_binary();
+
+    let mesh = pair().await;
+    let bridge_a = spawn_bridge(&mesh.alice, "p2-a");
+    let bridge_b = spawn_bridge(&mesh.bob, "p2-b");
+    wait_for_bridge(&bridge_a.addr).await;
+    wait_for_bridge(&bridge_b.addr).await;
+
+    let ch = Uuid::new_v4().to_string();
+    let topic = format!("buzz.v1.ch.{ch}");
+    // Injection point: daemon A carries test-published payloads to the mesh.
+    daemon_subscribe(&mesh.alice, &topic).await;
+
+    // B joins the channel topic via a live REQ (same pattern as prove_direction).
+    let sub_keys = Keys::generate();
+    let mut sub_ws = connect_ws(&bridge_b.addr).await;
+    authenticate(&mut sub_ws, &sub_keys, &bridge_b.addr).await;
+    let filter = Filter::new()
+        .kinds([Kind::from(9u16)])
+        .custom_tag(letter(Alphabet::H), ch.as_str());
+    send_msg(
+        &mut sub_ws,
+        ClientMessage::req(SubscriptionId::new("p2-live"), vec![filter.clone()]),
+    )
+    .await;
+    let pre = drain_until_eose(&mut sub_ws, "p2-live", Instant::now() + Duration::from_secs(15))
+        .await;
+    assert_eq!(pre, 0, "fresh channel must be empty");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let root_keys = Keys::generate();
+    let root = EventBuilder::new(Kind::from(9u16), "wp5-p2 root")
+        .tag(Tag::custom(TagKind::custom("h"), [ch.as_str()]))
+        .sign_with_keys(&root_keys)
+        .expect("sign root");
+    let root_id = root.id.to_hex();
+    let reply_keys = Keys::generate();
+    let reply = signed_reply(&reply_keys, &ch, &root_id, "wp5-p2 reply-first");
+    let reply_id = reply.id.to_hex();
+
+    // STEP 1: the REPLY arrives first. B's mesh door must park it.
+    daemon_publish(&mesh.alice, &topic, reply.as_json().as_bytes()).await;
+    let db = bridge_b.db_path.clone();
+    await_db(&db, "reply parked", Duration::from_secs(20), |db| {
+        db_count(
+            db,
+            "SELECT COUNT(*) FROM pending_orphans WHERE event_id = ?1",
+            &reply_id,
+        ) == 1
+    })
+    .await;
+    // Parked = invisible: no event row, no live fan-out, REQ serves nothing.
+    assert_eq!(
+        db_count(&db, "SELECT COUNT(*) FROM events WHERE id = ?1", &reply_id),
+        0,
+        "parked reply must not have an events row"
+    );
+    assert_no_live_event(&mut sub_ws, &reply_id, Duration::from_secs(2), "parked").await;
+    send_msg(
+        &mut sub_ws,
+        ClientMessage::req(SubscriptionId::new("p2-parked-hist"), vec![filter.clone()]),
+    )
+    .await;
+    let parked = drain_until_eose(
+        &mut sub_ws,
+        "p2-parked-hist",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(parked, 0, "parked reply must be invisible to REQ");
+    println!("[P2] reply parked: pending_orphans=1, events=0, REQ=0, no live fan-out");
+
+    // STEP 2: the ROOT lands. The parked reply must attach in the same commit
+    // and the thread counters must recompute.
+    daemon_publish(&mesh.alice, &topic, root.as_json().as_bytes()).await;
+    let live_root = await_live_event(
+        &mut sub_ws,
+        &root_id,
+        Instant::now() + Duration::from_secs(30),
+        "root-live",
+    )
+    .await;
+    assert_eq!(live_root["content"].as_str(), Some("wp5-p2 root"));
+    await_db(&db, "reply attached", Duration::from_secs(20), |db| {
+        db_count(db, "SELECT COUNT(*) FROM events WHERE id = ?1", &reply_id) == 1
+            && db_count(
+                db,
+                "SELECT COUNT(*) FROM pending_orphans WHERE event_id = ?1",
+                &reply_id,
+            ) == 0
+    })
+    .await;
+    // Recompute evidence: root's reply_count and descendant_count both moved
+    // to exactly 1 (single reply, root == parent here).
+    await_db(&db, "counters recomputed", Duration::from_secs(10), |db| {
+        db_count(
+            db,
+            "SELECT reply_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id,
+        ) == 1 && db_count(
+            db,
+            "SELECT descendant_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id,
+        ) == 1
+    })
+    .await;
+    // The drained reply is served from history (it is NOT re-dispatched live —
+    // only the ingested root is; asserted by the no-fan-out window below).
+    send_msg(
+        &mut sub_ws,
+        ClientMessage::req(SubscriptionId::new("p2-hist"), vec![filter.clone()]),
+    )
+    .await;
+    let ids = history_ids_until_eose(&mut sub_ws, "p2-hist", Instant::now() + Duration::from_secs(15))
+        .await;
+    assert!(
+        ids.contains(&root_id) && ids.contains(&reply_id),
+        "[P2] history must serve root AND attached reply, got {ids:?}"
+    );
+    assert_no_live_event(&mut sub_ws, &reply_id, Duration::from_secs(2), "drain").await;
+    println!(
+        "[P2] PARK->ATTACH OK: reply parked on arrival, attached when root landed, \
+         reply_count=descendant_count=1, history serves both"
+    );
+}
+
+/// WP5 property 3 — dedupe by event id survives gossip redelivery.
+///
+/// The same signed event is delivered to bridge B TWICE over the fabric with
+/// DIFFERENT wire bytes (pretty-printed re-serialization — a byte-identical
+/// republish is dropped by the pubsub payload-replay cache before it reaches
+/// the bridge, so byte variance is what makes the redelivery real). A control
+/// event with a fresh id proves the byte-different path delivers. Then:
+/// single row, unchanged counters, no second live fan-out, and the bridge's
+/// own log proves the copy arrived and was deduped THERE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires spawning real x0xd daemons"]
+async fn e2e_gossip_redelivery_is_idempotent() {
+    let _g = suite_lock().await;
+    ensure_x0xd_binary();
+
+    let mesh = pair().await;
+    let bridge_a = spawn_bridge(&mesh.alice, "p3-a");
+    let bridge_b = spawn_bridge(&mesh.bob, "p3-b");
+    wait_for_bridge(&bridge_a.addr).await;
+    wait_for_bridge(&bridge_b.addr).await;
+
+    let ch = Uuid::new_v4().to_string();
+    let topic = format!("buzz.v1.ch.{ch}");
+    daemon_subscribe(&mesh.alice, &topic).await;
+
+    let sub_keys = Keys::generate();
+    let mut sub_ws = connect_ws(&bridge_b.addr).await;
+    authenticate(&mut sub_ws, &sub_keys, &bridge_b.addr).await;
+    let filter = Filter::new()
+        .kinds([Kind::from(9u16)])
+        .custom_tag(letter(Alphabet::H), ch.as_str());
+    send_msg(
+        &mut sub_ws,
+        ClientMessage::req(SubscriptionId::new("p3-live"), vec![filter.clone()]),
+    )
+    .await;
+    let pre = drain_until_eose(&mut sub_ws, "p3-live", Instant::now() + Duration::from_secs(15))
+        .await;
+    assert_eq!(pre, 0, "fresh channel must be empty");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Seed root + reply so a counter exists to protect.
+    let root_keys = Keys::generate();
+    let root = EventBuilder::new(Kind::from(9u16), "wp5-p3 root")
+        .tag(Tag::custom(TagKind::custom("h"), [ch.as_str()]))
+        .sign_with_keys(&root_keys)
+        .expect("sign root");
+    let root_id = root.id.to_hex();
+    daemon_publish(&mesh.alice, &topic, root.as_json().as_bytes()).await;
+    await_live_event(
+        &mut sub_ws,
+        &root_id,
+        Instant::now() + Duration::from_secs(30),
+        "root-live",
+    )
+    .await;
+
+    let reply_keys = Keys::generate();
+    let reply = signed_reply(&reply_keys, &ch, &root_id, "wp5-p3 reply");
+    let reply_id = reply.id.to_hex();
+    daemon_publish(&mesh.alice, &topic, reply.as_json().as_bytes()).await;
+    await_live_event(
+        &mut sub_ws,
+        &reply_id,
+        Instant::now() + Duration::from_secs(30),
+        "reply-live",
+    )
+    .await;
+    let db = bridge_b.db_path.clone();
+    await_db(&db, "reply stored", Duration::from_secs(20), |db| {
+        db_count(db, "SELECT COUNT(*) FROM events WHERE id = ?1", &reply_id) == 1
+    })
+    .await;
+    assert_eq!(
+        db_count(
+            &db,
+            "SELECT reply_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id
+        ),
+        1,
+        "baseline reply_count must be 1"
+    );
+
+    // CONTROL: a fresh-id event as pretty-printed (byte-different) JSON MUST
+    // arrive live — proving the redelivery path carries such payloads to B.
+    let control = EventBuilder::new(Kind::from(9u16), "wp5-p3 control")
+        .tag(Tag::custom(TagKind::custom("h"), [ch.as_str()]))
+        .sign_with_keys(&root_keys)
+        .expect("sign control");
+    let control_id = control.id.to_hex();
+    let control_pretty = serde_json::to_string_pretty(&control).expect("pretty control");
+    assert_ne!(
+        control_pretty,
+        control.as_json(),
+        "control: pretty serialization must differ on the wire"
+    );
+    daemon_publish(&mesh.alice, &topic, control_pretty.as_bytes()).await;
+    await_live_event(
+        &mut sub_ws,
+        &control_id,
+        Instant::now() + Duration::from_secs(30),
+        "control-live",
+    )
+    .await;
+    println!("[P3] control: byte-different payload arrived live (redelivery path works)");
+
+    // SUBJECT: redeliver the REPLY — same event id, different wire bytes.
+    let reply_pretty = serde_json::to_string_pretty(&reply).expect("pretty reply");
+    assert_ne!(reply_pretty, reply.as_json());
+    daemon_publish(&mesh.alice, &topic, reply_pretty.as_bytes()).await;
+
+    // No second live fan-out within the window...
+    assert_no_live_event(&mut sub_ws, &reply_id, Duration::from_secs(3), "redelivery").await;
+    // ...exactly one row...
+    assert_eq!(
+        db_count(&db, "SELECT COUNT(*) FROM events WHERE id = ?1", &reply_id),
+        1,
+        "redelivery must not insert a duplicate row"
+    );
+    // ...counters untouched...
+    assert_eq!(
+        db_count(
+            &db,
+            "SELECT reply_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id
+        ),
+        1,
+        "redelivery must not double-bump reply_count"
+    );
+    assert_eq!(
+        db_count(
+            &db,
+            "SELECT descendant_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id
+        ),
+        1,
+        "redelivery must not double-bump descendant_count"
+    );
+    // ...the copy PROVABLY reached the bridge and was deduped there (not
+    // dropped upstream): bridge B's own log carries the duplicate line.
+    let log = std::fs::read_to_string(&bridge_b.log_path).expect("bridge B log");
+    assert!(
+        log.contains("mesh ingest duplicate") && log.contains(reply_id.as_str()),
+        "bridge B log must show the duplicate arriving and being deduped locally"
+    );
+    // ...and history serves exactly one copy.
+    send_msg(
+        &mut sub_ws,
+        ClientMessage::req(SubscriptionId::new("p3-hist"), vec![filter.clone()]),
+    )
+    .await;
+    let ids = history_ids_until_eose(&mut sub_ws, "p3-hist", Instant::now() + Duration::from_secs(15))
+        .await;
+    let copies = ids.iter().filter(|i| *i == &reply_id).count();
+    assert_eq!(copies, 1, "history must serve exactly one copy, got {ids:?}");
+
+    // BYTE-IDENTICAL redelivery — the common redelivery form. The fabric does
+    // NOT suppress it: pubsub msg_id = H(topic, epoch_secs, peer, payload),
+    // so a republish one second later carries a fresh msg_id and is delivered
+    // again in full. A second duplicate line must appear at the bridge — and
+    // the store must STILL hold exactly one row with untouched counters.
+    daemon_publish(&mesh.alice, &topic, reply.as_json().as_bytes()).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dup_lines = loop {
+        let log_now = std::fs::read_to_string(&bridge_b.log_path).expect("bridge B log");
+        let n = log_now
+            .lines()
+            .filter(|l| l.contains("mesh ingest duplicate") && l.contains(reply_id.as_str()))
+            .count();
+        if n >= 2 {
+            break n;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "byte-identical redelivery never reached the bridge \
+             (expected a second duplicate log line for {reply_id})"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(dup_lines, 2, "both redeliveries arrived and were deduped");
+    assert_eq!(
+        db_count(&db, "SELECT COUNT(*) FROM events WHERE id = ?1", &reply_id),
+        1,
+        "byte-identical redelivery must not insert a duplicate row"
+    );
+    assert_eq!(
+        db_count(
+            &db,
+            "SELECT reply_count FROM thread_metadata WHERE event_id = ?1",
+            &root_id
+        ),
+        1,
+        "byte-identical redelivery must not double-bump reply_count"
+    );
+    assert_no_live_event(&mut sub_ws, &reply_id, Duration::from_secs(2), "identical").await;
+    println!(
+        "[P3] IDEMPOTENT OK: reply redelivered TWICE (byte-different + byte-identical), \
+         both deduped by event id at the bridge — 1 row, counters unchanged, \
+         no second fan-out, both arrivals logged"
+    );
 }
