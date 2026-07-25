@@ -76,6 +76,11 @@ fn from_window_bounds(b: history::WindowBounds) -> WindowBounds {
 /// carries an empty `Some`-set (matches nothing) — the caller must return an
 /// empty result rather than an unconstrained query (FilterSpec empty vec =
 /// UNCONSTRAINED).
+///
+/// The mapping is TOTAL over `Filter`'s dimensions (`ids`/`authors`/`kinds`/
+/// `since`/`until`/every generic tag; `search` and `limit` are routed by
+/// [`run_query`]). Nothing may be dropped here: an unevaluated dimension does
+/// not fail closed, it over-matches.
 fn to_filter_spec(f: &Filter) -> Option<FilterSpec> {
     if f.ids.as_ref().is_some_and(|s| s.is_empty())
         || f.authors.as_ref().is_some_and(|s| s.is_empty())
@@ -94,13 +99,13 @@ fn to_filter_spec(f: &Filter) -> Option<FilterSpec> {
     if let Some(kinds) = &f.kinds {
         spec.kinds = kinds.iter().map(|k| u32::from(k.as_u16())).collect();
     }
+    // EVERY generic tag dimension is carried through, not just #h/#e/#p.
+    // Dropping one widens the result set instead of narrowing it: a
+    // `{"kinds":[39000],"#d":[channel]}` addressable lookup that loses its `#d`
+    // returns every 39000 and the client takes the wrong row. `#h` case folding
+    // is the store's job (`query::tag_is_case_insensitive`), not ours.
     for (tag, values) in &f.generic_tags {
-        match tag.as_str() {
-            "h" => spec.h = values.iter().map(|v| v.to_lowercase()).collect(),
-            "e" => spec.e = values.iter().cloned().collect(),
-            "p" => spec.p = values.iter().cloned().collect(),
-            _ => {} // FilterSpec only models #h/#e/#p.
-        }
+        spec = spec.with_tag(tag.as_str(), values.iter().cloned());
     }
     spec.since = f
         .since
@@ -113,10 +118,10 @@ fn to_filter_spec(f: &Filter) -> Option<FilterSpec> {
 
 fn e_kinds_spec(e: Vec<String>, kinds: Vec<u32>) -> FilterSpec {
     FilterSpec {
-        e,
         kinds,
         ..FilterSpec::default()
     }
+    .with_tag("e", e)
 }
 
 /// Route a filter through WP1b's `query`/`search`, honoring the
@@ -346,5 +351,90 @@ impl EventStore for HistoryStoreEventStore {
         // Startup topic pre-subscribe (survives restart) via WP1's DISTINCT
         // channel_id accessor (PR #8).
         self.store.known_channels().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{Alphabet, Kind, SingleLetterTag};
+
+    fn letter(c: Alphabet) -> SingleLetterTag {
+        SingleLetterTag::lowercase(c)
+    }
+
+    /// The M1a gate failure: Buzz resolves an addressable channel with
+    /// `{kinds:[39000], "#d":[id]}`. Losing `#d` here returns EVERY 39000 —
+    /// an unmodelled dimension over-matches, it does not fail closed.
+    #[test]
+    fn generic_tag_survives_the_mapping() {
+        let f = Filter::new()
+            .kind(Kind::from(39000u16))
+            .custom_tag(letter(Alphabet::D), "channel-uuid");
+        let spec = to_filter_spec(&f).expect("filter is satisfiable");
+        assert_eq!(spec.kinds, vec![39000]);
+        assert_eq!(
+            spec.tags.get("d").map(Vec::as_slice),
+            Some(["channel-uuid".to_string()].as_slice()),
+            "#d must reach the store"
+        );
+    }
+
+    /// Every tag name the client sends is carried, not just #h/#e/#p.
+    #[test]
+    fn mapping_is_total_over_tag_names() {
+        let f = Filter::new()
+            .custom_tag(letter(Alphabet::H), "chan")
+            .custom_tag(letter(Alphabet::D), "dee")
+            .custom_tag(letter(Alphabet::A), "39000:pk:dee")
+            .custom_tag(letter(Alphabet::K), "9");
+        let spec = to_filter_spec(&f).expect("filter is satisfiable");
+        let mut names: Vec<&str> = spec.tags.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "d", "h", "k"]);
+    }
+
+    /// `#h` case folding belongs to the store (`query::tag_is_case_insensitive`),
+    /// so the spec keeps what the client sent — one lowercasing site, not two.
+    #[test]
+    fn h_tag_case_is_left_to_the_store() {
+        let f = Filter::new().custom_tag(letter(Alphabet::H), "MiXeD");
+        let spec = to_filter_spec(&f).expect("filter is satisfiable");
+        assert_eq!(
+            spec.tags.get("h").map(Vec::as_slice),
+            Some(["MiXeD".to_string()].as_slice())
+        );
+    }
+
+    /// An empty `Some`-set matches NOTHING. It must become an early empty
+    /// return, never an empty `FilterSpec` vec (which is UNCONSTRAINED) —
+    /// otherwise `{"#d":[]}` would return the whole store.
+    #[test]
+    fn empty_some_set_fails_closed() {
+        let empty_tag = Filter::new()
+            .kind(Kind::from(39000u16))
+            .custom_tags(letter(Alphabet::D), Vec::<String>::new());
+        assert!(
+            to_filter_spec(&empty_tag).is_none(),
+            "empty #d set must not widen to unconstrained"
+        );
+
+        for f in [
+            Filter::new().ids(Vec::new()),
+            Filter::new().authors(Vec::new()),
+            Filter::new().kinds(Vec::new()),
+        ] {
+            assert!(to_filter_spec(&f).is_none());
+        }
+    }
+
+    /// A non-empty tag set alongside an empty one still fails closed: the
+    /// conjunction as a whole is unsatisfiable.
+    #[test]
+    fn one_empty_set_poisons_the_conjunction() {
+        let f = Filter::new()
+            .custom_tag(letter(Alphabet::H), "chan")
+            .custom_tags(letter(Alphabet::D), Vec::<String>::new());
+        assert!(to_filter_spec(&f).is_none());
     }
 }

@@ -124,6 +124,51 @@ async fn seed_39000_served_from_real_store() {
     assert_eq!(general.unwrap()["kind"], 39000);
 }
 
+/// The M1a gate failure, end to end over `/query`. Buzz resolves an addressable
+/// (NIP-33/NIP-29) channel with `{kinds:[39000], "#d":[id], limit:1}`. The seed
+/// stores TWO 39000s (`general` + the alice-tyler DM), so a bridge that drops
+/// `#d` hands back `general` for both lookups — the client takes row `[0]`,
+/// finds no `about` tag, and `channel.description.trim()` throws.
+#[tokio::test]
+async fn addressable_d_query_resolves_the_right_channel() {
+    let (addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+    let dm_id = x0x_nostr_bridge::seed::dm_channel_id("alice-tyler");
+
+    let d_tag_of = |e: &Value| {
+        e["tags"]
+            .as_array()
+            .and_then(|t| t.iter().find(|tag| tag[0] == "d"))
+            .and_then(|tag| tag[1].as_str().map(str::to_string))
+            .unwrap()
+    };
+
+    for want in [dm_id.as_str(), "general"] {
+        let arr = query(
+            addr,
+            TYLER,
+            json!([{ "kinds": [39000], "#d": [want], "limit": 1 }]),
+        )
+        .await;
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "#d must narrow 39000 to one row for {want}");
+        assert_eq!(
+            d_tag_of(&arr[0]),
+            want,
+            "under `limit:1` a dropped #d silently serves the wrong channel"
+        );
+    }
+
+    // An unsatisfiable #d must return nothing, never fall back to everything.
+    let none = query(
+        addr,
+        TYLER,
+        json!([{ "kinds": [39000], "#d": ["no-such-channel"] }]),
+    )
+    .await;
+    assert!(none.as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn window_returns_row_and_single_39006() {
     let (addr, _state) = spawn_real().await;

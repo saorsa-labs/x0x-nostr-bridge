@@ -52,8 +52,15 @@ fn push_in_clause(
     params.extend(vals);
 }
 
+/// Whether a tag name matches case-insensitively. Only `#h`: proto lowercases
+/// channel ids, so both sides are lowered. Every other tag is exact per NIP-01.
+fn tag_is_case_insensitive(tag: &str) -> bool {
+    tag == "h"
+}
+
 /// Push a generic-tag `EXISTS(... json_each ...)` clause for a non-empty list.
-/// `#h` is matched case-insensitively (both sides lowercased); other tags exact.
+/// Works for ANY tag name — the name is bound as a parameter, never interpolated
+/// — so no tag dimension has to be dropped for want of a column.
 fn push_tag_clause(
     where_parts: &mut Vec<String>,
     params: &mut Vec<SqlValue>,
@@ -117,9 +124,17 @@ fn build_where(f: &FilterSpec) -> (Vec<String>, Vec<SqlValue>) {
         where_parts.push("e.created_at <= ?".to_string());
         params.push(SqlValue::from(until));
     }
-    push_tag_clause(&mut where_parts, &mut params, "h", &f.h, true);
-    push_tag_clause(&mut where_parts, &mut params, "e", &f.e, false);
-    push_tag_clause(&mut where_parts, &mut params, "p", &f.p, false);
+    // Every tag dimension the spec carries gets a clause — AND across names, OR
+    // within one name's values. `BTreeMap` iteration keeps clause order stable.
+    for (tag, values) in &f.tags {
+        push_tag_clause(
+            &mut where_parts,
+            &mut params,
+            tag,
+            values,
+            tag_is_case_insensitive(tag),
+        );
+    }
 
     (where_parts, params)
 }
