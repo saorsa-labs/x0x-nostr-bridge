@@ -23,6 +23,9 @@ pub struct AgentInstance {
     pub api_token: String,
     /// Data directory (cleaned up on drop if temp).
     data_dir: PathBuf,
+    /// Gossip-plane id this instance declared at spawn (issue #206). A late
+    /// joiner must declare the SAME plane or the mesh refuses the connection.
+    pub network_id: String,
 }
 
 #[allow(dead_code)]
@@ -66,6 +69,8 @@ impl AgentInstance {
             .arg(&self.config_path)
             .arg("--name")
             .arg(&self.name)
+            .arg("--no-hard-coded-bootstrap")
+            .arg("--disable-peer-cache")
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
@@ -98,7 +103,7 @@ impl AgentInstance {
                 continue;
             }
             if trimmed.starts_with("bind_address") {
-                rebuilt.push_str(&format!("bind_address = \"0.0.0.0:{new_bind}\"\n"));
+                rebuilt.push_str(&format!("bind_address = \"127.0.0.1:{new_bind}\"\n"));
                 continue;
             }
             rebuilt.push_str(line);
@@ -120,6 +125,7 @@ impl AgentInstance {
             // unreachable by its own dialing so reconnection is attributable
             // solely to the survivor's proactive path.
             .arg("--no-hard-coded-bootstrap")
+            .arg("--disable-peer-cache")
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
@@ -331,7 +337,16 @@ pub async fn solo() -> (AgentInstance, u16) {
     let suffix = rand::random::<u16>();
     let api = allocate_unused_tcp_port();
     let bind = allocate_unused_udp_port();
-    let instance = start_instance(&binary, &format!("solo-{suffix}"), api, bind, "", "").await;
+    let instance = start_instance(
+        &binary,
+        &format!("solo-{suffix}"),
+        api,
+        bind,
+        "",
+        "",
+        &format!("x0x.test.solo-{suffix}"),
+    )
+    .await;
     (instance, bind)
 }
 
@@ -350,6 +365,9 @@ pub async fn join_peer(anchor: &AgentInstance, anchor_bind: u16) -> AgentInstanc
         bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{anchor_bind}\"]"),
         "",
+        // Same plane as the anchor: a different `network_id` would be refused
+        // at the gossip layer (issue #206) and the join would never peer.
+        &anchor.network_id.clone(),
     )
     .await;
     tokio::time::sleep(MESH_SETTLE_TIME).await;
@@ -378,6 +396,7 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         alice_bind,
         "",
         extra_config,
+        &format!("x0x.test.pair-{suffix}"),
     )
     .await;
     // Rolling start: use the same empirically-required delay as the trio so
@@ -391,6 +410,7 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
+        &format!("x0x.test.pair-{suffix}"),
     )
     .await;
     tokio::time::sleep(MESH_SETTLE_TIME).await;
@@ -439,6 +459,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
         alice_bind,
         "",
         extra_config,
+        &format!("x0x.test.trio-{suffix}"),
     )
     .await;
 
@@ -456,6 +477,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
         bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
+        &format!("x0x.test.trio-{suffix}"),
     )
     .await;
 
@@ -473,6 +495,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
         charlie_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
+        &format!("x0x.test.trio-{suffix}"),
     )
     .await;
 
@@ -634,6 +657,7 @@ async fn start_instance(
     bind_port: u16,
     bootstrap: &str,
     extra_config: &str,
+    network_id: &str,
 ) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
     let _ = std::fs::remove_dir_all(&config_dir);
@@ -650,16 +674,33 @@ async fn start_instance(
     }
 
     let config_path = config_dir.join("config.toml");
+    // Isolation contract (non-negotiable for test daemons):
+    // - `127.0.0.1` QUIC bind: ant-quic skips mDNS on loopback-only endpoints,
+    //    so the daemon neither advertises to nor browses the LAN — the
+    //    production daemon on this machine stays undiscoverable.
+    // - `bootstrap_peers = []` when no loopback peer is given: combined with
+    //    `--no-hard-coded-bootstrap` no seed peer is ever dialled.
+    // - `network_id`: a per-cluster gossip plane (issue #206), so even an
+    //    accidentally-established connection to an off-test daemon is refused
+    //    at the gossip layer.
+    // - `--disable-peer-cache` (CLI below): no cached peers are loaded/saved.
+    //
     // NOTE: `[update] enabled = false` is MANDATORY in every test config —
     // test binaries otherwise SELF-REPLACE via gossip-delivered auto-update
     // (x0x#226 standing rule). It goes LAST so table sections opened by
     // `extra_config` cannot swallow the flat keys above it.
+    let bootstrap_line = if bootstrap.trim().is_empty() {
+        "bootstrap_peers = []".to_string()
+    } else {
+        bootstrap.to_string()
+    };
     let config_content = format!(
         "api_address = \"127.0.0.1:{api_port}\"\n\
-         bind_address = \"0.0.0.0:{bind_port}\"\n\
+         bind_address = \"127.0.0.1:{bind_port}\"\n\
          data_dir = \"{}\"\n\
          log_level = \"warn\"\n\
-         {bootstrap}\n\
+         network_id = \"{network_id}\"\n\
+         {bootstrap_line}\n\
          {extra_config}\n\
          [update]\n\
          enabled = false\n",
@@ -688,6 +729,7 @@ async fn start_instance(
         .arg("--name")
         .arg(name)
         .arg("--no-hard-coded-bootstrap")
+        .arg("--disable-peer-cache")
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
@@ -705,6 +747,7 @@ async fn start_instance(
         api_addr: api_addr.clone(),
         api_token: String::new(), // placeholder — filled below
         data_dir: config_dir.clone(),
+        network_id: network_id.to_string(),
     };
 
     // Wait for health / token — if this panics, `instance` is dropped,

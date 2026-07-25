@@ -44,15 +44,32 @@ static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sy
 /// *this* crate points at `x0x-nostr-bridge/target` (absent). We instead pin
 /// the binary through the harness's sanctioned `X0XD_TEST_BINARY` override.
 static X0XD_BIN: LazyLock<PathBuf> = LazyLock::new(|| {
+    // Explicit override wins: `X0XD_TEST_BINARY` is the harness's sanctioned
+    // pin, and the only mechanism that works from a standalone worktree whose
+    // daemon build lives in an unrelated checkout.
+    if let Ok(pinned) = std::env::var("X0XD_TEST_BINARY") {
+        let pinned = PathBuf::from(pinned);
+        if pinned.exists() {
+            return pinned;
+        }
+        panic!(
+            "X0XD_TEST_BINARY set but does not exist: {}",
+            pinned.display()
+        );
+    }
     // `CARGO_MANIFEST_DIR` is the bridge crate dir (a direct workspace child),
     // so the workspace `target/` is one level up. The manifest-relative forms
-    // below cover the bridge-crate layout (used here) and the root-crate layout.
+    // below cover the bridge-crate layout, the root-crate layout, and a
+    // standalone checkout sitting next to an `x0x/` clone (this repo's
+    // worktree layout).
     let manifest = env!("CARGO_MANIFEST_DIR");
     let candidates = [
         PathBuf::from(manifest).join("../target/debug/x0xd"),
         PathBuf::from(manifest).join("../target/release/x0xd"),
         PathBuf::from(manifest).join("target/debug/x0xd"),
         PathBuf::from(manifest).join("target/release/x0xd"),
+        PathBuf::from(manifest).join("../x0x/target/debug/x0xd"),
+        PathBuf::from(manifest).join("../x0x/target/release/x0xd"),
     ];
     for c in &candidates {
         if c.exists() {
@@ -133,6 +150,9 @@ fn spawn_bridge(daemon: &AgentInstance, name: &str) -> BridgeGuard {
     let child = Command::new(bin)
         .env("BRIDGE_BIND", &addr)
         .env("BRIDGE_DB", db_path.as_os_str())
+        // The binary enforces the NIP-42 relay tag against this URL
+        // (`Settings::from_env` default); tests sign AUTH with `ws://{addr}`.
+        .env("BRIDGE_PUBLIC_URL", format!("http://{addr}"))
         .env("X0X_API", format!("http://{}", daemon.api_addr))
         .env("X0X_TOKEN", &daemon.api_token)
         .env("RUST_LOG", "info")
@@ -216,9 +236,11 @@ async fn send_msg(ws: &mut WS, msg: ClientMessage<'_>) {
         .expect("ws send");
 }
 
-/// Full NIP-42 handshake: read the AUTH challenge, sign a kind-22242 auth event
-/// tagged with the challenge, and assert the relay replies OK true.
-async fn authenticate(ws: &mut WS, keys: &Keys) {
+/// Full NIP-42 handshake: read the AUTH challenge, sign a kind-22242 auth
+/// event tagged with the challenge AND the relay URL the bridge enforces
+/// (`Settings::from_env` turns relay-tag enforcement on by default; the tag
+/// must equal `ws://{addr}` with no trailing slash), and assert OK true.
+async fn authenticate(ws: &mut WS, keys: &Keys, addr: &str) {
     let auth_msg = next_text(ws).await;
     assert_eq!(auth_msg[0], "AUTH", "expected AUTH challenge on connect");
     let challenge = auth_msg[1].as_str().expect("challenge str").to_string();
@@ -227,7 +249,10 @@ async fn authenticate(ws: &mut WS, keys: &Keys) {
             TagKind::custom("challenge"),
             [challenge.as_str()],
         ))
-        .tag(Tag::custom(TagKind::custom("relay"), ["ws://127.0.0.1/"]))
+        .tag(Tag::custom(
+            TagKind::custom("relay"),
+            [format!("ws://{addr}").as_str()],
+        ))
         .sign_with_keys(keys)
         .expect("sign auth");
     send_msg(ws, ClientMessage::auth(ev)).await;
@@ -342,7 +367,7 @@ async fn prove_direction(
     // (the REQ path's fire-and-forget ensure_topic) before anything is published.
     let sub_keys = Keys::generate();
     let mut sub_ws = connect_ws(subscriber_addr).await;
-    authenticate(&mut sub_ws, &sub_keys).await;
+    authenticate(&mut sub_ws, &sub_keys, subscriber_addr).await;
 
     let filter = Filter::new()
         .kinds([Kind::from(9u16)])
@@ -365,7 +390,7 @@ async fn prove_direction(
     // Publisher: signed kind-9 channel message.
     let pub_keys = Keys::generate();
     let mut pub_ws = connect_ws(publisher_addr).await;
-    authenticate(&mut pub_ws, &pub_keys).await;
+    authenticate(&mut pub_ws, &pub_keys, publisher_addr).await;
     let ev = EventBuilder::new(Kind::from(9u16), "hello over x0x")
         .tag(Tag::custom(TagKind::custom("h"), [channel]))
         .sign_with_keys(&pub_keys)
@@ -399,7 +424,7 @@ async fn prove_direction(
     .await;
     let latency = publish_at.elapsed();
     println!(
-        "[{label}] live EVENT received, content={:?}, A->B latency={latency:?}",
+        "[{label}] live EVENT received, content={:?}, latency={latency:?}",
         live["content"]
     );
     assert_eq!(
@@ -482,7 +507,7 @@ async fn e2e_single_bridge_global_history_roundtrip() {
 
     let keys = Keys::generate();
     let mut ws = connect_ws(&bridge.addr).await;
-    authenticate(&mut ws, &keys).await;
+    authenticate(&mut ws, &keys, &bridge.addr).await;
 
     let ev = EventBuilder::new(Kind::from(9u16), "smoke global message")
         .sign_with_keys(&keys)
