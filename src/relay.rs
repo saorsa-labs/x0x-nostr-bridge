@@ -22,7 +22,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use tower_http::cors::CorsLayer;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use nostr::{
@@ -31,6 +30,7 @@ use nostr::{
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tower_http::cors::CorsLayer;
 
 use crate::auth::ReplayCache;
 use crate::engine_api::{HistoryEngine, StubEngine};
