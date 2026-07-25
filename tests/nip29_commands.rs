@@ -842,9 +842,13 @@ async fn seeded_channels_satisfy_the_same_39000_contract() {
     let (_addr, state) = spawn_real().await;
     x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
 
-    let general = addressable(&state, KIND_META, "general")
-        .await
-        .expect("assertRelaySeeded polls for this 39000");
+    let general = addressable(
+        &state,
+        KIND_META,
+        &x0x_nostr_bridge::seed::channel_id("general"),
+    )
+    .await
+    .expect("assertRelaySeeded polls for this 39000");
     assert_eq!(tag(&general, "name").as_deref(), Some("general"));
     assert_eq!(
         tag(&general, "t").as_deref(),
@@ -906,7 +910,8 @@ async fn seeded_general_has_a_39002_for_every_test_member() {
     let (_addr, state) = spawn_real().await;
     x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
 
-    let members = addressable(&state, KIND_MEMBERS, "general")
+    let general_id = x0x_nostr_bridge::seed::channel_id("general");
+    let members = addressable(&state, KIND_MEMBERS, &general_id)
         .await
         .expect("general needs a 39002 or every seeded identity sees an empty sidebar");
     let expected: Vec<String> = x0x_nostr_bridge::seed::TEST_MEMBERS
@@ -915,7 +920,9 @@ async fn seeded_general_has_a_39002_for_every_test_member() {
         .collect();
     assert_eq!(p_pubkeys(&members), expected);
     assert_eq!(
-        all_addressable(&state, KIND_MEMBERS, "general").await.len(),
+        all_addressable(&state, KIND_MEMBERS, &general_id)
+            .await
+            .len(),
         1
     );
 }
@@ -940,7 +947,12 @@ async fn the_seed_materializes_every_channel_the_suite_assumes() {
     let dm_pair: Vec<String> = everyone[..2].to_vec();
 
     let expected: [(String, &str, &str, &[String]); 4] = [
-        ("general".to_string(), "general", "stream", &everyone),
+        (
+            x0x_nostr_bridge::seed::channel_id("general"),
+            "general",
+            "stream",
+            &everyone,
+        ),
         (
             x0x_nostr_bridge::seed::channel_id("random"),
             "random",
@@ -1022,7 +1034,12 @@ fn seeded_channel_ids_are_deterministic() {
         x0x_nostr_bridge::seed::channel_id("random"),
         x0x_nostr_bridge::seed::channel_id("random")
     );
-    // `general` keeps its literal id; the bridge's own tests use it as a channel
-    // literal, so changing it would be a gratuitous break.
-    assert_eq!(a[0].0, "general");
+    // Every seeded id is uuid5-derived, `general` included — the spec addresses
+    // it as uuid5(DNS,"buzz.channel.general").
+    assert_eq!(
+        a[0].0,
+        x0x_nostr_bridge::seed::channel_id("general"),
+        "general must be addressable by the id the specs hardcode"
+    );
+    assert!(a.iter().all(|(id, ..)| id != "general"));
 }

@@ -74,13 +74,16 @@ pub fn channel_id(name: &str) -> String {
 
 /// The channels the seed materializes, as `(id, name, channel_type, private)`.
 ///
-/// `general` keeps its literal `general` id: it predates this table and is used
-/// as a channel literal throughout the bridge's own integration tests, so
-/// renaming its d-tag would be a gratuitous break. The rest carry uuid ids like
-/// a client-created channel would.
+/// **Every** id is uuid5-derived, including `general`. It was briefly seeded as
+/// the literal `"general"` on the grounds that the bridge's own tests use that
+/// string as a channel literal — but those tests post their own rows and never
+/// read the seed, so the concern was local while the breakage was not:
+/// `parity-ancestor-island.spec.ts:33-34` addresses the seeded channel as
+/// `9f28288a-d724-587a-9709-92dc7f967110`, exactly `channel_id("general")`, so
+/// every row it seeded landed in a channel the client never opens.
 pub fn seeded_channels() -> Vec<(String, &'static str, &'static str, bool)> {
     vec![
-        ("general".to_string(), "general", "stream", false),
+        (channel_id("general"), "general", "stream", false),
         (channel_id("random"), "random", "stream", false),
         (channel_id("watercooler"), "watercooler", "forum", false),
         (
@@ -118,10 +121,12 @@ pub async fn seed_demo(state: &Arc<AppState>) -> anyhow::Result<()> {
     }
 
     // relay-signed 13534 membership list for `general` (dialect.md §3). This is
-    // a separate NIP-43 surface from the 39002 above, not a duplicate of it.
-    let list = state
-        .identity
-        .membership_list_event("general", &member_pubkeys, now)?;
+    // a separate NIP-43 surface from the 39002 above, not a duplicate of it. It
+    // has to name the same channel id, or it describes a channel nobody opens.
+    let list =
+        state
+            .identity
+            .membership_list_event(&channel_id("general"), &member_pubkeys, now)?;
     state.engine.seed_event(&list).await?;
 
     tracing::info!(
