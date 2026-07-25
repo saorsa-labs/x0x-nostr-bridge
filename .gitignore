@@ -3,3 +3,8 @@
 .DS_Store
 *.db
 nostr-bridge.db
+
+# Sibling-repo clones (CI convention: x0x built here for the mesh e2e).
+.deps/
+# Daemon logs from the mesh e2e (X0X_TEST_LOG_DIR).
+e2e-logs/
