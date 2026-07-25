@@ -1,7 +1,7 @@
 //! WP1b — general filter-query surface conformance.
 //!
 //! Exercises `HistoryStore::{query, count, search, events_by_ids,
-//! store_relay_authored}`: filter combinations (ids/kinds/authors/#h/#e/#p),
+//! store_relay_authored}`: filter combinations (ids/kinds/authors/generic tags),
 //! the served-state invariant (parked/quarantined/deleted rows are never
 //! returned), FTS search with p-gated exclusion, count/query parity, offset
 //! paging, and relay-authored + client replaceable dedup.
@@ -146,10 +146,8 @@ async fn query_by_h_e_p_tags() {
     // #h scoping returns both.
     let by_h = s
         .query(
-            &FilterSpec {
-                h: vec![CH.to_uppercase()], // #h matches case-insensitively
-                ..spec()
-            },
+            // #h matches case-insensitively
+            &spec().with_tag("h", [CH.to_uppercase()]),
             10,
             0,
         )
@@ -159,28 +157,14 @@ async fn query_by_h_e_p_tags() {
 
     // #e finds the reply.
     let by_e = s
-        .query(
-            &FilterSpec {
-                e: vec![referenced.id.to_hex()],
-                ..spec()
-            },
-            10,
-            0,
-        )
+        .query(&spec().with_tag("e", [referenced.id.to_hex()]), 10, 0)
         .await
         .unwrap();
     assert_eq!(ids_of(&by_e), vec![reply.id.to_hex()]);
 
     // #p finds the reply.
     let by_p = s
-        .query(
-            &FilterSpec {
-                p: vec![target.public_key().to_hex()],
-                ..spec()
-            },
-            10,
-            0,
-        )
+        .query(&spec().with_tag("p", [target.public_key().to_hex()]), 10, 0)
         .await
         .unwrap();
     assert_eq!(ids_of(&by_p), vec![reply.id.to_hex()]);
@@ -425,9 +409,9 @@ async fn relay_authored_seed_is_servable_and_dedups() {
         .query(
             &FilterSpec {
                 kinds: vec![39000],
-                h: vec![CH.to_string()],
                 ..spec()
-            },
+            }
+            .with_tag("h", [CH.to_string()]),
             10,
             0,
         )
@@ -497,4 +481,167 @@ async fn client_replaceable_kind0_dedup_via_ingest() {
         .unwrap();
     assert_eq!(got.len(), 1, "only latest profile kept");
     assert_eq!(got[0].content, "new profile");
+}
+
+// ---- generic tag dimensions ------------------------------------------------
+//
+// WHY: an unmodelled filter dimension does not fail closed — it WIDENS the
+// result set. Buzz resolves an addressable (NIP-33/NIP-29) channel with
+// `{kinds:[39000], "#d":[channelId], limit:1}`; a bridge that drops `#d`
+// returns every 39000, the client takes `[0]`, and reads the wrong channel's
+// metadata. These tests pin that every tag name the caller supplies is
+// evaluated, not just the `#h`/`#e`/`#p` the store once had columns for.
+
+const CH_B: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+const CH_C: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+#[tokio::test]
+async fn addressable_d_lookup_returns_only_that_channel() {
+    let s = store();
+    let relay = Keys::generate();
+    for (ch, name) in [(CH, "general"), (CH_B, "random"), (CH_C, "dev")] {
+        assert_eq!(
+            s.store_relay_authored(&seed_39000(&relay, ch, name, 1000))
+                .await
+                .unwrap(),
+            RelayStoreOutcome::Inserted
+        );
+    }
+
+    let got = s
+        .query(
+            &FilterSpec {
+                kinds: vec![39000],
+                ..spec()
+            }
+            .with_tag("d", [CH_B.to_string()]),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // The `limit:1` is what makes a dropped `#d` fatal rather than merely
+    // wasteful: the client takes row [0] and never sees the mismatch.
+    assert_eq!(got.len(), 1, "#d must narrow to one addressable row");
+    assert_eq!(got[0].content, "random");
+    assert_eq!(
+        s.count(
+            &FilterSpec {
+                kinds: vec![39000],
+                ..spec()
+            }
+            .with_tag("d", [CH_B.to_string()])
+        )
+        .await
+        .unwrap(),
+        1,
+        "count must apply #d exactly as query does"
+    );
+}
+
+#[tokio::test]
+async fn tag_names_and_while_values_or() {
+    let s = store();
+    let relay = Keys::generate();
+    // Two channels, each carrying a distinct `d`; `h` scopes them separately.
+    let general = build(&relay, 39000, "general", 1000, vec![h(CH), tag("d", &[CH])]);
+    let random = build(
+        &relay,
+        39000,
+        "random",
+        1001,
+        vec![h(CH_B), tag("d", &[CH_B])],
+    );
+    s.store_relay_authored(&general).await.unwrap();
+    s.store_relay_authored(&random).await.unwrap();
+
+    // OR within one name: both `d` values match.
+    let both = s
+        .query(
+            &spec().with_tag("d", [CH.to_string(), CH_B.to_string()]),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2, "values within one tag name are OR'd");
+
+    // AND across names: `#d`=CH_B with `#h`=CH is unsatisfiable.
+    let crossed = s
+        .query(
+            &spec()
+                .with_tag("d", [CH_B.to_string()])
+                .with_tag("h", [CH.to_string()]),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        crossed.is_empty(),
+        "distinct tag names must AND, not OR: got {:?}",
+        ids_of(&crossed)
+    );
+
+    // ...and the satisfiable pairing still resolves.
+    let matched = s
+        .query(
+            &spec()
+                .with_tag("d", [CH_B.to_string()])
+                .with_tag("h", [CH_B.to_string()]),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids_of(&matched), vec![random.id.to_hex()]);
+}
+
+#[tokio::test]
+async fn multi_char_tag_name_does_not_over_match() {
+    let s = store();
+    let relay = Keys::generate();
+    // `seed_39000` emits a multi-character `name` tag — a dimension the store
+    // never had a column for. It must be evaluated, not dropped.
+    s.store_relay_authored(&seed_39000(&relay, CH, "general", 1000))
+        .await
+        .unwrap();
+    s.store_relay_authored(&seed_39000(&relay, CH_B, "random", 1001))
+        .await
+        .unwrap();
+
+    let got = s
+        .query(&spec().with_tag("name", ["random".to_string()]), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "unmodelled tag name must still constrain");
+    assert_eq!(got[0].content, "random");
+
+    // A tag name no stored event carries matches nothing — it must never fall
+    // through to "unconstrained".
+    let none = s
+        .query(&spec().with_tag("zzz", ["anything".to_string()]), 10, 0)
+        .await
+        .unwrap();
+    assert!(
+        none.is_empty(),
+        "unknown tag name must not match everything"
+    );
+}
+
+#[tokio::test]
+async fn empty_tag_value_list_is_unconstrained_not_empty() {
+    let s = store();
+    let a = Keys::generate();
+    accept(&s, &msg(&a, "hello", 1000, vec![])).await;
+
+    // The empty vec is the UNCONSTRAINED sentinel at this layer; a nostr
+    // empty-`Some`-set (which matches nothing) is the ADAPTER's job to turn
+    // into an early empty return — see `history_adapter::to_filter_spec`.
+    let got = s
+        .query(&spec().with_tag("d", Vec::<String>::new()), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "empty value list means unconstrained here");
 }

@@ -3,6 +3,8 @@
 //! kind-39005 / kind-39006 overlay events from the `ThreadSummary` /
 //! `WindowBounds` payloads returned here (event synthesis + signing is NOT WP1).
 
+use std::collections::BTreeMap;
+
 use nostr::Event;
 
 /// Which door an event entered through. Local = strict Buzz semantics (HTTP
@@ -22,7 +24,7 @@ pub enum Door {
 /// list field, membership is a disjunction (OR). An **empty `Vec` means the
 /// field is UNCONSTRAINED** (not "match nothing") — the caller must map a
 /// nostr empty-`Some`-set (which matches nothing) to an early return, never to
-/// an empty vec here. Ids/authors/`p` are lowercase hex; `h` is lowercased on
+/// an empty vec here. Ids/authors are lowercase hex; `#h` is lowercased on
 /// match (channel ids are stored lowercase). Deleted rows and parked/quarantined
 /// events are never returned.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,14 +32,30 @@ pub struct FilterSpec {
     pub ids: Vec<String>,
     pub kinds: Vec<u32>,
     pub authors: Vec<String>,
-    /// `#h` channel scope.
-    pub h: Vec<String>,
-    /// `#e` event references.
-    pub e: Vec<String>,
-    /// `#p` pubkey references.
-    pub p: Vec<String>,
+    /// Tag constraints keyed by tag NAME (`"h"`, `"e"`, `"p"`, `"d"`, `"a"`, …)
+    /// — i.e. NIP-01 `#<name>` less the `#`. One map rather than per-tag fields
+    /// so a tag dimension cannot be silently dropped on the way in: dropping one
+    /// WIDENS the result set (over-match), it does not narrow it.
+    pub tags: BTreeMap<String, Vec<String>>,
     pub since: Option<i64>,
     pub until: Option<i64>,
+}
+
+impl FilterSpec {
+    /// Constrain `#<name>` to `values` (OR within the list, AND against every
+    /// other dimension). An empty `values` is UNCONSTRAINED and is not recorded
+    /// — callers map a nostr empty-`Some`-set to an early empty return instead.
+    pub fn with_tag<I, S>(mut self, name: &str, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let values: Vec<String> = values.into_iter().map(Into::into).collect();
+        if !values.is_empty() {
+            self.tags.insert(name.to_string(), values);
+        }
+        self
+    }
 }
 
 /// A request to (re)emit a relay-signed kind-39005 thread summary for a root,
