@@ -105,7 +105,7 @@ pub(crate) fn ingest_event(
         return Ok(match door {
             Door::Local => CoreOutcome::Rejected(reason),
             Door::Mesh => {
-                quarantine(tx, ev, &id, &reason, now)?;
+                quarantine(tx, ev, &id, QuarantineClass::RelayAuthored, &reason, now)?;
                 CoreOutcome::Quarantined(reason)
             }
         });
@@ -154,7 +154,14 @@ pub(crate) fn ingest_event(
                     ReplyResolution::Mismatch(reason) => Ok(match door {
                         Door::Local => CoreOutcome::Rejected(reason),
                         Door::Mesh => {
-                            quarantine(tx, ev, &id, &reason, now)?;
+                            quarantine(
+                                tx,
+                                ev,
+                                &id,
+                                QuarantineClass::AncestryMismatch,
+                                &reason,
+                                now,
+                            )?;
                             CoreOutcome::Quarantined(reason)
                         }
                     }),
@@ -526,6 +533,36 @@ fn delete_flow(
 
 // ---- mesh door: park / quarantine / drain ----------------------------------
 
+/// Why a mesh-door event was quarantined (kept, invisible, logged — design §4).
+/// The WARN message is built from this class: the previous hard-coded
+/// "ancestry mismatch" message also labelled relay-authored copies (e.g. a
+/// gossiped kind 39005), contradicting the accurate `reason` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineClass {
+    /// A mesh copy of a relay-authored kind: kept invisible so the bridge
+    /// never re-broadcasts relay state as if it were client content.
+    RelayAuthored,
+    /// A reply whose NIP-10 ancestry failed to resolve (root/channel/depth).
+    AncestryMismatch,
+}
+
+impl QuarantineClass {
+    /// Short label interpolated into the quarantine WARN message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::RelayAuthored => "relay-authored kind",
+            Self::AncestryMismatch => "ancestry mismatch",
+        }
+    }
+}
+
+/// The quarantine WARN message for `class`. Factored out of the
+/// `tracing::warn!` call so the per-class wording is pinned by unit tests — a
+/// hard-coded message mislabelled every non-ancestry quarantine.
+fn quarantine_message(class: QuarantineClass) -> String {
+    format!("mesh event quarantined ({})", class.label())
+}
+
 fn park(tx: &Transaction<'_>, ev: &Event, id: &str, parent: &str, now: i64) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO pending_orphans(event_id, parent_event_id, raw, received_at) \
@@ -541,7 +578,14 @@ fn park(tx: &Transaction<'_>, ev: &Event, id: &str, parent: &str, now: i64) -> R
     Ok(())
 }
 
-fn quarantine(tx: &Transaction<'_>, ev: &Event, id: &str, reason: &str, now: i64) -> Result<()> {
+fn quarantine(
+    tx: &Transaction<'_>,
+    ev: &Event,
+    id: &str,
+    class: QuarantineClass,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO quarantine(event_id, raw, reason, received_at) \
          VALUES(?1, ?2, ?3, ?4)",
@@ -551,7 +595,8 @@ fn quarantine(tx: &Transaction<'_>, ev: &Event, id: &str, reason: &str, now: i64
     tracing::warn!(
         event_id = id,
         reason = reason,
-        "mesh event quarantined (ancestry mismatch)"
+        "{}",
+        quarantine_message(class)
     );
     Ok(())
 }
@@ -598,7 +643,14 @@ fn drain_pending(
                             park(tx, &ev, &oid, &parent, now)?;
                         }
                         ReplyResolution::Mismatch(reason) => {
-                            quarantine(tx, &ev, &oid, &reason, now)?;
+                            quarantine(
+                                tx,
+                                &ev,
+                                &oid,
+                                QuarantineClass::AncestryMismatch,
+                                &reason,
+                                now,
+                            )?;
                         }
                         ReplyResolution::Ok(rr) => {
                             let emit = insert_reply(
@@ -836,4 +888,180 @@ fn resolve_markers(tags: &[Vec<String>]) -> Markers {
 fn derive_own_root(tags: &[Vec<String>], own_id: &str) -> String {
     let (root, reply) = scan_markers(tags);
     root.or(reply).unwrap_or_else(|| own_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag, TagKind};
+    use std::sync::{Arc, Mutex};
+
+    /// The WARN message must name the ACTUAL quarantine class: every
+    /// relay-authored gossip copy was previously logged as "ancestry
+    /// mismatch", contradicting the accurate `reason` field next to it
+    /// (observed live: `reason="invalid: kind 39005 is relay-authored"`
+    /// under an "ancestry mismatch" message).
+    #[test]
+    fn quarantine_message_reflects_class() {
+        let relay = quarantine_message(QuarantineClass::RelayAuthored);
+        assert!(relay.contains("relay-authored"), "got: {relay}");
+        assert!(
+            !relay.contains("ancestry mismatch"),
+            "relay-authored quarantine mislabelled: {relay}"
+        );
+
+        let ancestry = quarantine_message(QuarantineClass::AncestryMismatch);
+        assert!(ancestry.contains("ancestry mismatch"), "got: {ancestry}");
+
+        assert_ne!(relay, ancestry, "classes must log distinct messages");
+    }
+
+    /// The class labels are the human-readable contract of the WARN line;
+    /// pin them so a wording change is a deliberate, reviewed act.
+    #[test]
+    fn quarantine_class_labels() {
+        assert_eq!(
+            QuarantineClass::RelayAuthored.label(),
+            "relay-authored kind"
+        );
+        assert_eq!(
+            QuarantineClass::AncestryMismatch.label(),
+            "ancestry mismatch"
+        );
+    }
+
+    // ---- call-site pins: capture the WARN the real ingest path emits --------
+    //
+    // The helper tests above pin the wording; they cannot pin WHICH class a
+    // call site passes (a relay-authored ingest logged as AncestryMismatch
+    // would keep them green — verified by mutation: flipping the class at the
+    // relay-authored call site turns this next test red and reproduces the
+    // exact original mislabel in the captured WARN). Driving `ingest_event`
+    // under a thread-local capturing subscriber pins the mapping end to end.
+    // `with_default` is reliable here because the engine call is synchronous
+    // on the test thread — no `spawn_blocking` boundary (that boundary is why
+    // the integration suite cannot do this).
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let buf = self.0.lock().expect("capture lock");
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A marked NIP-10 e-tag: `["e", <id>, "", <marker>]`.
+    fn e_marked(id: &str, marker: &str) -> Tag {
+        Tag::custom(
+            TagKind::custom("e".to_string()),
+            [id.to_string(), String::new(), marker.to_string()],
+        )
+    }
+
+    fn kind9(keys: &Keys, content: &str, tags: Vec<Tag>) -> Event {
+        let mut b = EventBuilder::new(Kind::from(9u16), content);
+        for t in tags {
+            b = b.tag(t);
+        }
+        b.sign_with_keys(keys).expect("sign")
+    }
+
+    /// Ingest `events` in order through the mesh door on one fresh in-memory
+    /// store, under one thread-local capture. Returns the LAST outcome and
+    /// every log line emitted on this thread.
+    fn mesh_ingest_capturing(events: &[&Event]) -> (CoreOutcome, String) {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        crate::history::schema::migrate(&conn).expect("migrate");
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            let tx = conn.transaction().expect("tx");
+            let mut last = None;
+            for (i, ev) in events.iter().enumerate() {
+                last = Some(
+                    ingest_event(&tx, ev, Door::Mesh, 1_000 + i as i64).expect("ingest_event"),
+                );
+            }
+            last.expect("at least one event")
+        });
+        (outcome, capture.text())
+    }
+
+    /// The relay-authored call site: a gossiped kind 39005 must log the
+    /// RELAY-AUTHORED class — the exact live mislabel that motivated the fix.
+    #[test]
+    fn mesh_relay_authored_kind_logs_relay_authored_class() {
+        let keys = Keys::generate();
+        let ev = EventBuilder::new(Kind::from(39_005u16), "{\"reply_count\":999}")
+            .sign_with_keys(&keys)
+            .expect("sign");
+
+        let (outcome, logs) = mesh_ingest_capturing(&[&ev]);
+        assert!(
+            matches!(outcome, CoreOutcome::Quarantined(_)),
+            "expected Quarantined from mesh-door 39005"
+        );
+        assert!(
+            logs.contains("mesh event quarantined (relay-authored kind)"),
+            "WARN missing relay-authored class; logs:\n{logs}"
+        );
+        assert!(
+            !logs.contains("ancestry mismatch"),
+            "relay-authored quarantine mislabelled as ancestry; logs:\n{logs}"
+        );
+    }
+
+    /// The ancestry-mismatch call site: a reply whose root tag contradicts
+    /// its parent's ancestry must log the ANCESTRY class. (The
+    /// `drain_pending` mismatch site passes the same class; both share
+    /// `resolve_reply`.)
+    #[test]
+    fn mesh_root_mismatch_logs_ancestry_class() {
+        let keys = Keys::generate();
+        let root = kind9(&keys, "root", vec![]);
+        let root_id = root.id.to_hex();
+        // Parent exists, but the claimed root is wrong -> ancestry mismatch.
+        let wrong_root = "b".repeat(64);
+        let bad = kind9(
+            &keys,
+            "bad",
+            vec![e_marked(&wrong_root, "root"), e_marked(&root_id, "reply")],
+        );
+
+        let (outcome, logs) = mesh_ingest_capturing(&[&root, &bad]);
+        assert!(
+            matches!(outcome, CoreOutcome::Quarantined(_)),
+            "expected Quarantined from root-mismatched reply"
+        );
+        assert!(
+            logs.contains("mesh event quarantined (ancestry mismatch)"),
+            "WARN missing ancestry class; logs:\n{logs}"
+        );
+    }
 }

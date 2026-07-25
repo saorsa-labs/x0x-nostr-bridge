@@ -1,0 +1,111 @@
+name: Mesh e2e (nightly)
+
+# The two-bridge mesh proof (`tests/e2e_convergence.rs`) spawns real x0xd
+# daemons and bridge binaries, so — like the Playwright gate in tic-tac-toe
+# (docs/design/m1a.md WP4) — it runs nightly and on demand, not per-PR.
+#
+# Test selection is BY TEST TARGET: everything in the `e2e_convergence`
+# target runs, ignored or not (`--run-ignored all`). The tests are currently
+# `#[ignore = "requires spawning real x0xd daemons"]`-gated on main; if that
+# gating changes (WP5-A), this job still selects the same target.
+#
+# x0xd discovery: the test's X0XD_BIN resolver (tests/e2e_convergence.rs)
+# searches `target/{debug,release}/x0xd` relative to the bridge manifest and
+# panics if absent — the harness's `X0XD_TEST_BINARY` env override is only
+# honoured AFTER a candidate exists (X0XD_BIN runs first and overwrites the
+# env). So the built x0xd MUST be staged at `target/release/x0xd` below; the
+# env var is exported too, in case the resolver order changes.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # nightly, 04:17 UTC (off the top-of-hour rush)
+  workflow_dispatch:
+    inputs:
+      x0x_ref:
+        description: "x0x git ref (tag or branch) to build x0xd from"
+        required: false
+        default: "v0.34.3"
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Daemon logs land here (harness `test_log_stdio`) so they survive the
+  # per-node temp data dirs and can be uploaded on failure.
+  X0X_TEST_LOG_DIR: e2e-logs
+
+jobs:
+  mesh-convergence:
+    name: Two-bridge convergence over live x0xd
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone x0x (${{ github.event.inputs.x0x_ref || 'v0.34.3' }})
+        # The bridge has no dependency on the x0x crate — it drives a daemon
+        # over REST+WS — so no sibling symlink is needed, just the source to
+        # build x0xd from. `.deps/` mirrors the x0x repo's clone convention.
+        # Pinned to v0.34.3: the x0xd version the M1a design (docs/design/
+        # m1a.md) names for every endpoint the bridge uses.
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 \
+            --branch "${{ github.event.inputs.x0x_ref || 'v0.34.3' }}" \
+            https://github.com/saorsa-labs/x0x .deps/x0x
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo (bridge)
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo (x0x)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ".deps/x0x"
+          key: x0xd
+
+      - name: Build x0xd (release)
+        # Release, mirroring the x0x repo's own integration jobs; a debug
+        # x0xd is slow enough to distort the convergence latency budgets.
+        working-directory: .deps/x0x
+        run: cargo build --release --bin x0xd
+
+      - name: Stage x0xd where the test resolver looks
+        # tests/e2e_convergence.rs X0XD_BIN candidate #2:
+        # `<bridge manifest>/target/release/x0xd`.
+        run: |
+          mkdir -p target/release
+          cp .deps/x0x/target/release/x0xd target/release/x0xd
+
+      - name: Run mesh e2e (target-scoped, ignored included, serialized)
+        # Mirrors `just test-e2e`. The daemons are spawned by the vendored
+        # cluster harness with --no-hard-coded-bootstrap, per-node data dirs,
+        # loopback API binds, and `[update] enabled = false`.
+        #
+        # --test-threads 1 is LOAD-BEARING: nextest runs each test in its own
+        # process, so the suite's process-local TEST_MUTEX serializes nothing;
+        # an unthrottled run lets the two-daemon pair mesh and the solo daemon
+        # boot concurrently — port-allocation TOCTOU plus two x0xd meshes
+        # forming on one loopback host (mDNS cross-discovery). Serial test
+        # processes are the only thing making the mesh-form timing
+        # deterministic under nextest.
+        env:
+          X0XD_TEST_BINARY: ${{ github.workspace }}/target/release/x0xd
+        run: cargo nextest run --all-features --test e2e_convergence --run-ignored all --test-threads 1
+
+      - name: Upload daemon + bridge logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: mesh-e2e-logs
+          path: |
+            e2e-logs/
+            /tmp/x0x-bridge-*.log
+          if-no-files-found: warn
