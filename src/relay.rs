@@ -22,6 +22,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::cors::CorsLayer;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use nostr::{
@@ -289,6 +290,13 @@ impl AppState {
 
 /// Build the axum router: WS + NIP-11 on `/`, plus the Buzz HTTP dialect routes
 /// behind a shared 1 MiB body cap.
+///
+/// A permissive CORS layer is applied because the Buzz desktop client, when run
+/// as a web page (the Playwright e2e gate serves it from a different origin than
+/// the relay), issues cross-origin `fetch`es to `/query` and `/events` with a
+/// custom `X-Pubkey` header and a JSON body — which the browser gates behind a
+/// CORS preflight. The relay binds loopback and authenticates per request, so
+/// any-origin is acceptable here; native Tauri clients are unaffected.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root_handler))
@@ -297,6 +305,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/count", post(crate::http::post_count))
         .route("/info", get(crate::http::get_info))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT))
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
