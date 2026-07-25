@@ -46,8 +46,9 @@ check: fmt-check lint build test doc
 # ── e2e (non-hermetic) ────────────────────────────────────────────────────
 
 # Two-bridge cross-mesh convergence over live x0xd daemons (#[ignore] — needs
-# a built x0xd binary and joins a real network, so it cannot run under `test`).
-# Requires the sibling x0x checkout built: `cargo build --bin x0xd` there, then
-# point X0XD_TEST_BINARY at the resulting binary.
+# a built x0xd binary and spawns real daemons, so it cannot run under `test`).
+# Requires the sibling x0x checkout built (`cargo build --release --bin x0xd`
+# there) and the binary staged where the test's resolver looks:
+# `cp ../x0x/target/release/x0xd target/release/x0xd` here first.
 test-e2e:
     cargo nextest run --all-features --test e2e_convergence --run-ignored all

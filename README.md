@@ -15,13 +15,44 @@ independently reviewed, and promoted to this standalone repository. It has **no
 dependency on the `x0x` crate** — it talks to a local `x0xd` daemon over its
 REST + WebSocket API.
 
-- **60 active tests** (unit + adversarial integration) pass hermetically, plus
-  **2 `#[ignore]`-gated e2e** tests that boot real `x0xd` daemons and join a
-  live network.
+- **182 active tests** (unit + integration) pass hermetically, plus
+  **2 `#[ignore]`-gated e2e** tests that boot real `x0xd` daemons.
 - Two-bridge cross-mesh convergence **verified live**: two `x0xd` daemons, two
   bridges, kind-9 events converging A→B in **45.75 ms** and B→A in **36.42 ms**,
   with SQLite history served before EOSE on the receiving side
   (`tests/e2e_convergence.rs`).
+
+## What M1a proves — and what it does not
+
+M1a is a **single-bridge** milestone. Read this section before quoting any
+result from it.
+
+**Proven — the Nostr dialect.** The stock, unmodified Buzz desktop client
+(0.4.24) runs against ONE bridge fronting ONE x0xd, with the M1a acceptance
+gate (`docs/design/m1a.md` §1) passing 24/24 across three consecutive runs.
+The bridge serves Buzz's extended relay dialect — HTTP
+`/events`/`/query`/`/count`, WS NIP-01/42, the thread read-model, the demo
+seed — faithfully enough that Buzz cannot tell it from `buzz-relay`.
+
+**Not proven — distribution.**
+
+- Per design decision **D1, one bridge = one community = the serialized
+  writer**. There is no shared cross-bridge state in M1a: each bridge's
+  local SQLite is authoritative for its own community (**D3**).
+- **Raw events converge** across bridges over the x0x mesh — the
+  `e2e_convergence` suite proves delivery A→B and B→A, live and from SQLite
+  history. **Thread counters do not.** The 39005 reply/descendant counts a
+  bridge serves are computed from its own SQLite, so two bridges watching
+  the same channel can legitimately serve different counters. Cross-bridge
+  thread-counter convergence is **deliberately deferred to Stage 3**
+  (substrate: x0x#275/#276); it is a design decision, not a bug.
+- Known gate limitation: `stream.spec.ts:477` (scroll-pinning under live
+  fan-out) keys on an unread count that Buzz derives **client-side** from
+  array lengths (`useUnreadChannels.ts`) — the relay supplies nothing to
+  it. A failure there is a stock-Buzz timing race, not a bridge defect.
+
+If a claim sounds stronger than "stock Buzz works against one bridge, and
+raw events converge between bridges", it is overstated.
 
 This repository is the base for **bridge v2**, whose scope is Buzz's extended
 relay dialect — see the fork plan in the tic-tac-toe repo,
@@ -45,10 +76,12 @@ from the x0x data dir).
 just test                                  # 60 hermetic tests (nextest)
 just check                                 # fmt + clippy + build + test + doc
 
-# e2e (non-hermetic): boots real x0xd daemons and joins a live network.
-# Build x0xd from a sibling x0x checkout first, then:
-X0XD_TEST_BINARY=/path/to/x0xd \
-  cargo nextest run --test e2e_convergence --run-ignored all
+# e2e (non-hermetic): boots real x0xd daemons on a localhost mesh.
+# Build x0xd from a sibling x0x checkout first (`cargo build --release
+# --bin x0xd` there), then stage it where the test's resolver looks —
+# `target/{debug,release}/x0xd` under THIS crate — and run:
+cp /path/to/x0x/target/release/x0xd target/release/x0xd
+cargo nextest run --test e2e_convergence --run-ignored all
 ```
 
 `tests/adversarial_{relay,transport}.rs` encode the red-team findings

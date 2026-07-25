@@ -39,6 +39,19 @@ upstream; we implement 1012 as a cheap stretch, see WP3), presence synthesis
 (gate never queries it; return empty), multi-tenant Host maps, 429
 *enforcement* (grammar implemented, limiter off by default).
 
+**Proof scope — read before quoting M1a results.** The gate above is a
+**single-bridge dialect proof**: one bridge, one x0xd, stock Buzz. Passing
+it proves the bridge serves Buzz's Nostr dialect faithfully. It does **not**
+prove distribution: per D1 one bridge is one community and its only writer,
+and per D3 the bridge-local SQLite is authoritative. Raw events converge
+across bridges over the mesh (the spike e2e; WP5 makes that proof
+repeatable), but **thread counters are per-bridge** — each bridge computes
+its 39005 counts from its own SQLite, and cross-bridge counter convergence
+is deliberately deferred to Stage 3 (x0x#275/#276). One known gate flake is
+not a bridge defect: `stream.spec.ts:477` keys on an unread count Buzz
+derives client-side from array lengths (the relay supplies nothing to it),
+so it races on stock-Buzz timing.
+
 ## 2. Architecture decisions
 
 - **D1 — One bridge instance = one community = the serialized writer.** This
@@ -47,8 +60,9 @@ upstream; we implement 1012 as a cheap stretch, see WP3), presence synthesis
   in M1a. Cross-bridge convergence of thread metadata is deliberately deferred
   (Stage 3 moves thread computation into x0xd's ADR-0023 store; x0x#275/#276
   are the tracked substrate issues). The spike's two-bridge e2e stays
-  ignore-gated with a doc note: raw events converge; thread counters are
-  per-bridge until Stage 3.
+  ignore-gated per-PR and runs on the nightly mesh-e2e CI job
+  (`.github/workflows/e2e-mesh.yml`): raw events converge; thread counters
+  are per-bridge until Stage 3.
 - **D2 — Two-door ingest.** Local door (HTTP `/events` + WS `EVENT`): strict
   Buzz semantics — orphan replies REJECTED (`invalid: reply parent not found`),
   root verified server-side, depth cap 100, counters bumped in the same SQLite
