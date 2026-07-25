@@ -26,10 +26,25 @@ pub struct AgentInstance {
     /// Gossip-plane id this instance declared at spawn (issue #206). A late
     /// joiner must declare the SAME plane or the mesh refuses the connection.
     pub network_id: String,
+    /// This daemon's own MachineId hex — the identity its peers see in their
+    /// `/peers` list (ant-quic `PeerId` == `MachineId` bytes). Filled by
+    /// [`Self::refresh_runtime_state`] from `GET /agent`; used by
+    /// [`assert_nodes_connected`] to prove a mesh contains ONLY the daemons
+    /// this cluster spawned.
+    pub machine_id: String,
 }
 
 #[allow(dead_code)]
 impl AgentInstance {
+    /// Shared HTTP client with a hard per-request timeout: a stalled child
+    /// must fail the test, never hang a nightly job forever.
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build reqwest client")
+    }
+
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
@@ -75,7 +90,9 @@ impl AgentInstance {
             .stderr(stderr)
             .spawn()
             .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
-        self.refresh_runtime_state().await;
+        self.refresh_runtime_state()
+            .await
+            .unwrap_or_else(|e| panic!("x0xd {} failed post-restart readiness: {e}", self.name));
     }
     /// Restart the daemon on a FORCED NEW QUIC (bind) port, keeping the same
     /// data_dir (hence the same `machine.key`/`agent.key` → same MachineId and
@@ -130,18 +147,20 @@ impl AgentInstance {
             .stderr(stderr)
             .spawn()
             .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
-        self.refresh_runtime_state().await;
+        self.refresh_runtime_state()
+            .await
+            .unwrap_or_else(|e| panic!("x0xd {} failed post-restart readiness: {e}", self.name));
         new_bind
     }
 
-    async fn refresh_runtime_state(&mut self) {
+    async fn refresh_runtime_state(&mut self) -> Result<(), String> {
         let api_addr = self.api_addr.clone();
         // 90s, not 30s: debug-build daemons doing ML-DSA keygen plus
         // hard-coded internet bootstrap rounds come healthy anywhere from
         // ~15s to >30s depending on machine load — the old deadline was a
         // flakiness knife-edge for the first daemon of a run.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        let client = reqwest::Client::new();
+        let client = Self::http_client();
         loop {
             if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
                 if resp.status().is_success() {
@@ -149,7 +168,10 @@ impl AgentInstance {
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("x0xd {} did not become healthy within 90s", self.name);
+                return Err(format!(
+                    "x0xd {} did not become healthy within 90s",
+                    self.name
+                ));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -161,14 +183,29 @@ impl AgentInstance {
                 let token = token.trim().to_string();
                 if !token.is_empty() {
                     self.api_token = token;
-                    return;
+                    break;
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("Cannot find api-token for {}", self.name);
+                return Err(format!("Cannot find api-token for {}", self.name));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // Own MachineId — the identity this daemon's peers will report. Read
+        // once per (re)start; `machine.key` is preserved across restarts, so
+        // the value is stable for a given data dir.
+        let agent: serde_json::Value = self
+            .get("/agent")
+            .await
+            .json()
+            .await
+            .map_err(|e| format!("parse /agent for {}: {e}", self.name))?;
+        self.machine_id = agent["machine_id"]
+            .as_str()
+            .ok_or_else(|| format!("/agent for {} missing machine_id", self.name))?
+            .to_string();
+        Ok(())
     }
 
     /// Full URL for a given API path.
@@ -180,7 +217,7 @@ impl AgentInstance {
     /// (#127 / WS1.6). Session tokens are the only kind accepted via `?token=`
     /// query strings on WS/SSE endpoints.
     pub async fn session_token(&self) -> String {
-        let resp = reqwest::Client::new()
+        let resp = Self::http_client()
             .post(format!("http://{}/auth/session", self.api_addr))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .send()
@@ -202,7 +239,7 @@ impl AgentInstance {
 
     /// Authenticated GET request.
     pub async fn get(&self, path: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .get(self.url(path))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .send()
@@ -212,7 +249,7 @@ impl AgentInstance {
 
     /// Authenticated POST request with JSON body.
     pub async fn post(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .post(self.url(path))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .json(&body)
@@ -223,7 +260,7 @@ impl AgentInstance {
 
     /// Authenticated PUT request with JSON body.
     pub async fn put(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .put(self.url(path))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .json(&body)
@@ -234,7 +271,7 @@ impl AgentInstance {
 
     /// Authenticated PATCH request with JSON body.
     pub async fn patch(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .patch(self.url(path))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .json(&body)
@@ -245,7 +282,7 @@ impl AgentInstance {
 
     /// Authenticated DELETE request.
     pub async fn delete(&self, path: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .delete(self.url(path))
             .header("Authorization", format!("Bearer {}", self.api_token))
             .send()
@@ -255,7 +292,7 @@ impl AgentInstance {
 
     /// Unauthenticated GET request.
     pub async fn raw_get(&self, path: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        Self::http_client()
             .get(self.url(path))
             .send()
             .await
@@ -335,19 +372,14 @@ pub async fn pair() -> AgentPair {
 pub async fn solo() -> (AgentInstance, u16) {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let api = allocate_unused_tcp_port();
-    let bind = allocate_unused_udp_port();
-    let instance = start_instance(
+    start_instance(
         &binary,
         &format!("solo-{suffix}"),
-        api,
-        bind,
         "",
         "",
         &format!("x0x.test.solo-{suffix}"),
     )
-    .await;
-    (instance, bind)
+    .await
 }
 
 /// Start a daemon that bootstraps to an already-running instance's UDP
@@ -356,13 +388,9 @@ pub async fn solo() -> (AgentInstance, u16) {
 pub async fn join_peer(anchor: &AgentInstance, anchor_bind: u16) -> AgentInstance {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let api = allocate_unused_tcp_port();
-    let bind = allocate_unused_udp_port();
-    let instance = start_instance(
+    let (instance, _bind) = start_instance(
         &binary,
         &format!("late-{suffix}"),
-        api,
-        bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{anchor_bind}\"]"),
         "",
         // Same plane as the anchor: a different `network_id` would be refused
@@ -384,16 +412,9 @@ pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
 pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let alice_api = allocate_unused_tcp_port();
-    let alice_bind = allocate_unused_udp_port();
-    let bob_api = allocate_unused_tcp_port();
-    let bob_bind = allocate_unused_udp_port();
-
-    let alice = start_instance(
+    let (alice, alice_bind) = start_instance(
         &binary,
         &format!("pair-alice-{suffix}"),
-        alice_api,
-        alice_bind,
         "",
         extra_config,
         &format!("x0x.test.pair-{suffix}"),
@@ -403,11 +424,9 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
     // bob has a stable alice to bootstrap against. The previous 5s was too
     // short and let propagation-dependent tests race mesh formation.
     tokio::time::sleep(ROLLING_START_DELAY).await;
-    let bob = start_instance(
+    let (bob, _bob_bind) = start_instance(
         &binary,
         &format!("pair-bob-{suffix}"),
-        bob_api,
-        bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
         &format!("x0x.test.pair-{suffix}"),
@@ -440,23 +459,15 @@ async fn create_cluster() -> AgentCluster {
 async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let alice_api = allocate_unused_tcp_port();
-    let alice_bind = allocate_unused_udp_port();
-    let bob_api = allocate_unused_tcp_port();
-    let bob_bind = allocate_unused_udp_port();
-    let charlie_api = allocate_unused_tcp_port();
-    let charlie_bind = allocate_unused_udp_port();
 
     // Rolling start: each node needs time for its QUIC listener to bind and
     // mDNS/bootstrap to propagate before the next node comes up. Starting
     // all three simultaneously causes connection races and mesh instability.
 
     eprintln!("[cluster] starting alice...");
-    let alice = start_instance(
+    let (alice, alice_bind) = start_instance(
         &binary,
         &format!("test-alice-{suffix}"),
-        alice_api,
-        alice_bind,
         "",
         extra_config,
         &format!("x0x.test.trio-{suffix}"),
@@ -470,11 +481,9 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     tokio::time::sleep(ROLLING_START_DELAY).await;
 
     eprintln!("[cluster] starting bob (bootstraps to alice)...");
-    let bob = start_instance(
+    let (bob, _bob_bind) = start_instance(
         &binary,
         &format!("test-bob-{suffix}"),
-        bob_api,
-        bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
         &format!("x0x.test.trio-{suffix}"),
@@ -488,11 +497,9 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     tokio::time::sleep(ROLLING_START_DELAY).await;
 
     eprintln!("[cluster] starting charlie (bootstraps to alice)...");
-    let charlie = start_instance(
+    let (charlie, _charlie_bind) = start_instance(
         &binary,
         &format!("test-charlie-{suffix}"),
-        charlie_api,
-        charlie_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
         &format!("x0x.test.trio-{suffix}"),
@@ -533,17 +540,51 @@ async fn assert_mesh_connected(
 /// node still has zero peers after 30s. A disconnected mesh produces flaky
 /// propagation results, so we fail loudly here rather than let the test proceed
 /// and time out on a downstream convergence assertion.
+///
+/// CONTAMINATION GUARD (safety-critical): a nonzero peer count is NOT
+/// sufficient — every reported peer identity must be one of the daemons THIS
+/// cluster spawned. Peer identities are MachineId hex (ant-quic `PeerId` ==
+/// `MachineId` bytes), read from each spawned daemon's own `GET /agent`. If
+/// isolation ever breaks, a foreign (e.g. production) daemon satisfies the
+/// readiness check and silently carries test traffic; here that fails the
+/// test immediately instead of masking the breach.
 async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
+    let known: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.machine_id.as_str()).collect();
+    assert!(
+        !known.contains(""),
+        "machine_id not populated for a spawned daemon — readiness cannot be verified"
+    );
     for node in nodes {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let resp: serde_json::Value = node.get("/peers").await.json().await.unwrap_or_default();
-            let peers = resp
+            let peer_ids: Vec<String> = resp["peers"]
                 .as_array()
-                .or_else(|| resp["peers"].as_array())
-                .map_or(0, |a| a.len());
-            if peers > 0 {
-                eprintln!("[cluster] {} sees {peers} peer(s)", node.name);
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A foreign peer is fatal IMMEDIATELY — waiting cannot make a
+            // contaminated mesh safe.
+            for id in &peer_ids {
+                assert!(
+                    known.contains(id.as_str()),
+                    "[cluster] FATAL: {} sees foreign peer {id} — the test mesh is \
+                     contaminated by a daemon this cluster did not spawn (isolation \
+                     breach). Refusing to run: test traffic must never reach foreign \
+                     daemons. Known spawned identities: {known:?}",
+                    node.name
+                );
+            }
+            if !peer_ids.is_empty() {
+                eprintln!(
+                    "[cluster] {} sees {} peer(s), all cluster-spawned",
+                    node.name,
+                    peer_ids.len()
+                );
                 break;
             }
             if tokio::time::Instant::now() > deadline {
@@ -650,7 +691,82 @@ fn test_log_stdio(name: &str, suffix: &str) -> Option<(Stdio, Stdio)> {
     Some((Stdio::from(open()), Stdio::from(open())))
 }
 
+/// Kill stale x0xd TEST daemons from prior failed runs that may still own
+/// these ports. Two guards against killing an innocent bystander (the
+/// pre-hardening version piped `lsof -ti tcp:PORT | xargs kill -9` blind —
+/// including querying tcp: for a UDP port):
+/// 1. protocol-correct lookup: TCP for the API port, UDP for the QUIC bind.
+/// 2. process-identity match: the command line must contain BOTH an `x0xd`
+///    binary AND this harness's `x0x-test-` config-dir marker. The
+///    production daemon (`./target/release/x0xd --skip-update-check`, no test
+///    config) never matches, and neither does any unrelated service that
+///    merely holds the same port number.
+fn kill_stale_test_daemons(api_port: u16, bind_port: u16) {
+    for (proto, port) in [("tcp", api_port), ("udp", bind_port)] {
+        let Ok(out) = Command::new("lsof")
+            .args(["-ti", &format!("{proto}:{port}")])
+            .output()
+        else {
+            continue;
+        };
+        for pid in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+        {
+            let Ok(cmd) = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+            else {
+                continue;
+            };
+            let cmdline = String::from_utf8_lossy(&cmd.stdout);
+            if cmdline.contains("x0xd") && cmdline.contains("x0x-test-") {
+                eprintln!("[cluster] killing stale test daemon pid={pid}: {cmdline}");
+                let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
+        }
+    }
+}
+
+/// Allocate ports and start one daemon, retrying once with FRESH ports if the
+/// first attempt fails readiness. The port allocation is bind-to-zero-then-
+/// release (a TOCTOU window: a racer can steal the port before the daemon
+/// binds it, surfacing as a readiness timeout); one retry collapses the
+/// failure probability without masking a genuinely broken daemon, which still
+/// panics after attempt two.
 async fn start_instance(
+    binary: &PathBuf,
+    name: &str,
+    bootstrap: &str,
+    extra_config: &str,
+    network_id: &str,
+) -> (AgentInstance, u16) {
+    let mut last_err = String::new();
+    for attempt in 1..=2u32 {
+        let api_port = allocate_unused_tcp_port();
+        let bind_port = allocate_unused_udp_port();
+        match try_start_instance(
+            binary,
+            name,
+            api_port,
+            bind_port,
+            bootstrap,
+            extra_config,
+            network_id,
+        )
+        .await
+        {
+            Ok(instance) => return (instance, bind_port),
+            Err(e) => {
+                eprintln!("[cluster] {name} start attempt {attempt} failed: {e}");
+                last_err = e;
+            }
+        }
+    }
+    panic!("x0xd {name} failed to start after 2 attempts: {last_err}");
+}
+
+async fn try_start_instance(
     binary: &PathBuf,
     name: &str,
     api_port: u16,
@@ -658,20 +774,12 @@ async fn start_instance(
     bootstrap: &str,
     extra_config: &str,
     network_id: &str,
-) -> AgentInstance {
+) -> Result<AgentInstance, String> {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
     let _ = std::fs::remove_dir_all(&config_dir);
     let _ = std::fs::create_dir_all(&config_dir);
 
-    // Kill stale daemons from prior failed runs that may still own these fixed ports.
-    for port in [api_port, bind_port] {
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
-            ))
-            .status();
-    }
+    kill_stale_test_daemons(api_port, bind_port);
 
     let config_path = config_dir.join("config.toml");
     // Isolation contract (non-negotiable for test daemons):
@@ -733,10 +841,10 @@ async fn start_instance(
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
+        .map_err(|e| format!("Failed to start x0xd {name}: {e}"))?;
 
     // Wrap the Child in an AgentInstance immediately so that Drop kills
-    // the process if anything below panics (health timeout, token read, etc.).
+    // the process if anything below fails (health timeout, token read, etc.).
     // We'll fill in api_token once we have it.
     let api_addr = format!("127.0.0.1:{api_port}");
     let mut instance = AgentInstance {
@@ -748,10 +856,11 @@ async fn start_instance(
         api_token: String::new(), // placeholder — filled below
         data_dir: config_dir.clone(),
         network_id: network_id.to_string(),
+        machine_id: String::new(), // placeholder — filled below
     };
 
-    // Wait for health / token — if this panics, `instance` is dropped,
-    // killing the process.
-    instance.refresh_runtime_state().await;
-    instance
+    // Wait for health / token — on failure `instance` is dropped, killing the
+    // process, and the retry wrapper starts over on fresh ports.
+    instance.refresh_runtime_state().await?;
+    Ok(instance)
 }

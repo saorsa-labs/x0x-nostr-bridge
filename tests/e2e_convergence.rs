@@ -184,10 +184,14 @@ fn spawn_bridge(daemon: &AgentInstance, name: &str) -> BridgeGuard {
 /// Wait for the bridge's NIP-11 info endpoint (`GET /` with
 /// `accept: application/nostr+json`) to answer — the readiness probe that
 /// proves the binary booted, connected to its daemon, and bound its listener.
-async fn wait_for_bridge(addr: &str) {
+/// Returns false at the deadline instead of panicking so callers can retry.
+async fn bridge_ready(addr: &str, budget: Duration) -> bool {
     let url = format!("http://{addr}/");
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let deadline = Instant::now() + budget;
     loop {
         if let Ok(resp) = client
             .get(&url)
@@ -198,16 +202,35 @@ async fn wait_for_bridge(addr: &str) {
             if resp.status().is_success() {
                 if let Ok(body) = resp.json::<Value>().await {
                     if body.get("name").is_some() {
-                        return;
+                        return true;
                     }
                 }
             }
         }
         if Instant::now() > deadline {
-            panic!("bridge at {addr} did not answer NIP-11 within 30s");
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Spawn a bridge and wait for readiness, retrying once on a FRESH port.
+/// `free_tcp_port` is bind-to-zero-then-release: a racer can steal the port
+/// before the bridge binds it, which otherwise surfaces as a 30s hang then a
+/// panic (or worse, a hung nightly job). One retry collapses that without
+/// masking a genuinely broken bridge, which still panics after attempt two.
+async fn spawn_bridge_ready(daemon: &AgentInstance, name: &str) -> BridgeGuard {
+    for attempt in 1..=2u32 {
+        let guard = spawn_bridge(daemon, name);
+        if bridge_ready(&guard.addr, Duration::from_secs(30)).await {
+            return guard;
+        }
+        eprintln!(
+            "[{name}] bridge attempt {attempt} failed NIP-11 readiness; retrying on a fresh port"
+        );
+        // `guard` drops here — the failed child is killed before the retry.
+    }
+    panic!("bridge {name} did not answer NIP-11 after 2 attempts");
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +257,15 @@ async fn next_text(ws: &mut WS) -> Value {
     }
 }
 
+/// `next_text` with a hard deadline: a stalled bridge must fail the test
+/// with a named read, never hang the job forever.
+async fn next_text_within(ws: &mut WS, budget: Duration, what: &str) -> Value {
+    match tokio::time::timeout(budget, next_text(ws)).await {
+        Ok(v) => v,
+        Err(_) => panic!("timed out ({budget:?}) waiting for {what}"),
+    }
+}
+
 async fn send_msg(ws: &mut WS, msg: ClientMessage<'_>) {
     ws.send(WsMessage::Text(msg.as_json()))
         .await
@@ -245,7 +277,7 @@ async fn send_msg(ws: &mut WS, msg: ClientMessage<'_>) {
 /// (`Settings::from_env` turns relay-tag enforcement on by default; the tag
 /// must equal `ws://{addr}` with no trailing slash), and assert OK true.
 async fn authenticate(ws: &mut WS, keys: &Keys, addr: &str) {
-    let auth_msg = next_text(ws).await;
+    let auth_msg = next_text_within(ws, Duration::from_secs(10), "AUTH challenge").await;
     assert_eq!(auth_msg[0], "AUTH", "expected AUTH challenge on connect");
     let challenge = auth_msg[1].as_str().expect("challenge str").to_string();
     let ev = EventBuilder::new(Kind::from(22_242u16), "")
@@ -260,7 +292,7 @@ async fn authenticate(ws: &mut WS, keys: &Keys, addr: &str) {
         .sign_with_keys(keys)
         .expect("sign auth");
     send_msg(ws, ClientMessage::auth(ev)).await;
-    let ok = next_text(ws).await;
+    let ok = next_text_within(ws, Duration::from_secs(10), "AUTH OK").await;
     assert_eq!(ok[0], "OK");
     assert!(ok[2].as_bool().expect("status bool"), "AUTH should succeed");
 }
@@ -276,6 +308,128 @@ fn event_id_of(v: &Value) -> Option<&str> {
 
 fn letter(c: Alphabet) -> SingleLetterTag {
     SingleLetterTag::lowercase(c)
+}
+
+/// Ephemeral kind used ONLY for topic-readiness probes: dispatched live but
+/// NEVER stored (ingest.rs), so it cannot pollute history/DB assertions, and
+/// it sits outside every test filter's `kinds:[9]` so probes never fan out to
+/// the real subscriptions.
+const PROBE_KIND: u16 = 20_001;
+
+/// Watch for EVENT(`probe_id`) on subscription `probe_sub` for up to `window`;
+/// every other frame (EOSEs, real traffic) is drained and ignored.
+async fn saw_probe(ws: &mut WS, probe_sub: &str, probe_id: &str, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        let rem = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if rem.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(rem, next_text(ws)).await {
+            Ok(v) => {
+                if str_at(&v, 0) == Some("EVENT")
+                    && str_at(&v, 1) == Some(probe_sub)
+                    && event_id_of(&v) == Some(probe_id)
+                {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Open the probe subscription on the subscriber's bridge. The REQ also
+/// (re)triggers the bridge's fire-and-forget `ensure_topic` for the channel
+/// topic — the join the readiness barrier below then PROVES end to end.
+async fn open_probe_sub(ws: &mut WS, channel: &str, label: &str) -> String {
+    let sub = format!("{label}-probe");
+    let filter = Filter::new()
+        .kinds([Kind::from(PROBE_KIND)])
+        .custom_tag(letter(Alphabet::H), channel);
+    send_msg(
+        ws,
+        ClientMessage::req(SubscriptionId::new(sub.as_str()), vec![filter]),
+    )
+    .await;
+    sub
+}
+
+/// Sign one ephemeral probe event for `channel`.
+fn signed_probe(keys: &Keys, channel: &str) -> nostr::Event {
+    EventBuilder::new(Kind::from(PROBE_KIND), "topic-readiness probe")
+        .tag(Tag::custom(TagKind::custom("h"), [channel]))
+        .sign_with_keys(keys)
+        .expect("sign probe")
+}
+
+/// End-to-end topic-readiness barrier, publisher = a bridge WS connection
+/// (`prove_direction`): the probe rides the exact EVENT path the real publish
+/// will take, including the publisher bridge's own synchronous `ensure_topic`.
+/// Deterministic replacement for the old blind `sleep(2s)`: on slow CI the
+/// loop keeps probing while the mesh joins, and a genuine join failure panics
+/// at the deadline naming the stage — instead of losing the only real message.
+async fn await_topic_ready_ws(
+    pub_ws: &mut WS,
+    pub_keys: &Keys,
+    sub_ws: &mut WS,
+    channel: &str,
+    label: &str,
+) {
+    let probe_sub = open_probe_sub(sub_ws, channel, label).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // Signed by the PUBLISHER'S authed key: the WS door rejects events
+        // whose pubkey differs from the NIP-42 principal.
+        let probe = signed_probe(pub_keys, channel);
+        let probe_id = probe.id.to_hex();
+        send_msg(pub_ws, ClientMessage::event(probe)).await;
+        let ok = next_text_within(pub_ws, Duration::from_secs(5), "probe OK").await;
+        assert_eq!(str_at(&ok, 0), Some("OK"), "[{label}] probe must be OK'd");
+        assert!(
+            ok[2].as_bool().expect("status bool"),
+            "[{label}] probe publish rejected: {ok:?}"
+        );
+        if saw_probe(sub_ws, &probe_sub, &probe_id, Duration::from_secs(1)).await {
+            println!("[{label}] topic ready (probe round-trip confirmed)");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{label}] channel topic not ready within 20s — subscriber bridge never \
+             received a probe over the fabric"
+        );
+    }
+}
+
+/// Barrier variant where the publisher is a daemon REST injection (P2/P3):
+/// the probe rides the exact `POST /publish` path the injections will take.
+async fn await_topic_ready_daemon(
+    daemon: &AgentInstance,
+    sub_ws: &mut WS,
+    channel: &str,
+    label: &str,
+) {
+    let probe_sub = open_probe_sub(sub_ws, channel, label).await;
+    let topic = format!("buzz.v1.ch.{channel}");
+    let probe_keys = Keys::generate();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let probe = signed_probe(&probe_keys, channel);
+        let probe_id = probe.id.to_hex();
+        daemon_publish(daemon, &topic, probe.as_json().as_bytes()).await;
+        if saw_probe(sub_ws, &probe_sub, &probe_id, Duration::from_secs(1)).await {
+            println!("[{label}] topic ready (probe round-trip confirmed)");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{label}] channel topic not ready within 20s — subscriber bridge never \
+             received a probe over the fabric"
+        );
+    }
 }
 
 /// Drain frames for `sub` until its EOSE, counting delivered EVENT frames.
@@ -388,13 +542,15 @@ async fn prove_direction(
         "[{label}] fresh channel had stored events before publish"
     );
 
-    // Let the channel-topic subscription land on the subscriber's daemon.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Publisher: signed kind-9 channel message.
+    // Publisher connects, then an end-to-end probe barrier proves the channel
+    // topic is joined on BOTH sides (no blind sleep: the probe rides the exact
+    // EVENT path the real publish below will take).
     let pub_keys = Keys::generate();
     let mut pub_ws = connect_ws(publisher_addr).await;
     authenticate(&mut pub_ws, &pub_keys, publisher_addr).await;
+    await_topic_ready_ws(&mut pub_ws, &pub_keys, &mut sub_ws, channel, label).await;
+
+    // Publisher: signed kind-9 channel message.
     let ev = EventBuilder::new(Kind::from(9u16), "hello over x0x")
         .tag(Tag::custom(TagKind::custom("h"), [channel]))
         .sign_with_keys(&pub_keys)
@@ -477,10 +633,8 @@ async fn e2e_convergence_two_bridges_over_x0x_fabric() {
         mesh.alice.api_addr, mesh.bob.api_addr
     );
 
-    let bridge_a = spawn_bridge(&mesh.alice, "bridge-a");
-    let bridge_b = spawn_bridge(&mesh.bob, "bridge-b");
-    wait_for_bridge(&bridge_a.addr).await;
-    wait_for_bridge(&bridge_b.addr).await;
+    let bridge_a = spawn_bridge_ready(&mesh.alice, "bridge-a").await;
+    let bridge_b = spawn_bridge_ready(&mesh.bob, "bridge-b").await;
     println!("bridges ready: A={} B={}", bridge_a.addr, bridge_b.addr);
 
     let ch_a = Uuid::new_v4().to_string();
@@ -505,8 +659,7 @@ async fn e2e_single_bridge_global_history_roundtrip() {
     let (daemon, _bind) = solo().await;
     println!("solo daemon up: {}", daemon.api_addr);
 
-    let bridge = spawn_bridge(&daemon, "bridge-smoke");
-    wait_for_bridge(&bridge.addr).await;
+    let bridge = spawn_bridge_ready(&daemon, "bridge-smoke").await;
     println!("smoke bridge ready: {}", bridge.addr);
 
     let keys = Keys::generate();
@@ -694,10 +847,8 @@ async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
     ensure_x0xd_binary();
 
     let mesh = pair().await;
-    let bridge_a = spawn_bridge(&mesh.alice, "p2-a");
-    let bridge_b = spawn_bridge(&mesh.bob, "p2-b");
-    wait_for_bridge(&bridge_a.addr).await;
-    wait_for_bridge(&bridge_b.addr).await;
+    let _bridge_a = spawn_bridge_ready(&mesh.alice, "p2-a").await;
+    let bridge_b = spawn_bridge_ready(&mesh.bob, "p2-b").await;
 
     let ch = Uuid::new_v4().to_string();
     let topic = format!("buzz.v1.ch.{ch}");
@@ -723,7 +874,9 @@ async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
     )
     .await;
     assert_eq!(pre, 0, "fresh channel must be empty");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // End-to-end probe barrier: B's bridge has provably joined the channel
+    // topic (probe rides the exact daemon-publish path the injections take).
+    await_topic_ready_daemon(&mesh.alice, &mut sub_ws, &ch, "P2").await;
 
     let root_keys = Keys::generate();
     let root = EventBuilder::new(Kind::from(9u16), "wp5-p2 root")
@@ -842,10 +995,8 @@ async fn e2e_gossip_redelivery_is_idempotent() {
     ensure_x0xd_binary();
 
     let mesh = pair().await;
-    let bridge_a = spawn_bridge(&mesh.alice, "p3-a");
-    let bridge_b = spawn_bridge(&mesh.bob, "p3-b");
-    wait_for_bridge(&bridge_a.addr).await;
-    wait_for_bridge(&bridge_b.addr).await;
+    let _bridge_a = spawn_bridge_ready(&mesh.alice, "p3-a").await;
+    let bridge_b = spawn_bridge_ready(&mesh.bob, "p3-b").await;
 
     let ch = Uuid::new_v4().to_string();
     let topic = format!("buzz.v1.ch.{ch}");
@@ -869,7 +1020,8 @@ async fn e2e_gossip_redelivery_is_idempotent() {
     )
     .await;
     assert_eq!(pre, 0, "fresh channel must be empty");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // End-to-end probe barrier (same reasoning as P2).
+    await_topic_ready_daemon(&mesh.alice, &mut sub_ws, &ch, "P3").await;
 
     // Seed root + reply so a counter exists to protect.
     let root_keys = Keys::generate();
