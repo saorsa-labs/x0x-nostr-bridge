@@ -49,6 +49,8 @@ check: fmt-check lint build test doc
 # a built x0xd binary and spawns real daemons, so it cannot run under `test`).
 # Requires the sibling x0x checkout built (`cargo build --release --bin x0xd`
 # there) and the binary staged where the test's resolver looks:
-# `cp ../x0x/target/release/x0xd target/release/x0xd` here first.
+# `mkdir -p target/release && cp ../x0x/target/release/x0xd target/release/x0xd`
+# here first. --test-threads 1 is load-bearing: nextest forks per test, so the
+# suite's process-local TEST_MUTEX cannot serialize the daemon meshes.
 test-e2e:
-    cargo nextest run --all-features --test e2e_convergence --run-ignored all
+    cargo nextest run --all-features --test e2e_convergence --run-ignored all --test-threads 1

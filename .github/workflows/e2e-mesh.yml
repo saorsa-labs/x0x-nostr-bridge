@@ -84,13 +84,21 @@ jobs:
           mkdir -p target/release
           cp .deps/x0x/target/release/x0xd target/release/x0xd
 
-      - name: Run mesh e2e (target-scoped, ignored included)
+      - name: Run mesh e2e (target-scoped, ignored included, serialized)
         # Mirrors `just test-e2e`. The daemons are spawned by the vendored
         # cluster harness with --no-hard-coded-bootstrap, per-node data dirs,
         # loopback API binds, and `[update] enabled = false`.
+        #
+        # --test-threads 1 is LOAD-BEARING: nextest runs each test in its own
+        # process, so the suite's process-local TEST_MUTEX serializes nothing;
+        # an unthrottled run lets the two-daemon pair mesh and the solo daemon
+        # boot concurrently — port-allocation TOCTOU plus two x0xd meshes
+        # forming on one loopback host (mDNS cross-discovery). Serial test
+        # processes are the only thing making the mesh-form timing
+        # deterministic under nextest.
         env:
           X0XD_TEST_BINARY: ${{ github.workspace }}/target/release/x0xd
-        run: cargo nextest run --all-features --test e2e_convergence --run-ignored all
+        run: cargo nextest run --all-features --test e2e_convergence --run-ignored all --test-threads 1
 
       - name: Upload daemon + bridge logs
         if: failure()

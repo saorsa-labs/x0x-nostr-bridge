@@ -893,6 +893,8 @@ fn derive_own_root(tags: &[Vec<String>], own_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag, TagKind};
+    use std::sync::{Arc, Mutex};
 
     /// The WARN message must name the ACTUAL quarantine class: every
     /// relay-authored gossip copy was previously logged as "ancestry
@@ -925,6 +927,141 @@ mod tests {
         assert_eq!(
             QuarantineClass::AncestryMismatch.label(),
             "ancestry mismatch"
+        );
+    }
+
+    // ---- call-site pins: capture the WARN the real ingest path emits --------
+    //
+    // The helper tests above pin the wording; they cannot pin WHICH class a
+    // call site passes (a relay-authored ingest logged as AncestryMismatch
+    // would keep them green — verified by mutation: flipping the class at the
+    // relay-authored call site turns this next test red and reproduces the
+    // exact original mislabel in the captured WARN). Driving `ingest_event`
+    // under a thread-local capturing subscriber pins the mapping end to end.
+    // `with_default` is reliable here because the engine call is synchronous
+    // on the test thread — no `spawn_blocking` boundary (that boundary is why
+    // the integration suite cannot do this).
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let buf = self.0.lock().expect("capture lock");
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A marked NIP-10 e-tag: `["e", <id>, "", <marker>]`.
+    fn e_marked(id: &str, marker: &str) -> Tag {
+        Tag::custom(
+            TagKind::custom("e".to_string()),
+            [id.to_string(), String::new(), marker.to_string()],
+        )
+    }
+
+    fn kind9(keys: &Keys, content: &str, tags: Vec<Tag>) -> Event {
+        let mut b = EventBuilder::new(Kind::from(9u16), content);
+        for t in tags {
+            b = b.tag(t);
+        }
+        b.sign_with_keys(keys).expect("sign")
+    }
+
+    /// Ingest `events` in order through the mesh door on one fresh in-memory
+    /// store, under one thread-local capture. Returns the LAST outcome and
+    /// every log line emitted on this thread.
+    fn mesh_ingest_capturing(events: &[&Event]) -> (CoreOutcome, String) {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        crate::history::schema::migrate(&conn).expect("migrate");
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            let tx = conn.transaction().expect("tx");
+            let mut last = None;
+            for (i, ev) in events.iter().enumerate() {
+                last = Some(
+                    ingest_event(&tx, ev, Door::Mesh, 1_000 + i as i64).expect("ingest_event"),
+                );
+            }
+            last.expect("at least one event")
+        });
+        (outcome, capture.text())
+    }
+
+    /// The relay-authored call site: a gossiped kind 39005 must log the
+    /// RELAY-AUTHORED class — the exact live mislabel that motivated the fix.
+    #[test]
+    fn mesh_relay_authored_kind_logs_relay_authored_class() {
+        let keys = Keys::generate();
+        let ev = EventBuilder::new(Kind::from(39_005u16), "{\"reply_count\":999}")
+            .sign_with_keys(&keys)
+            .expect("sign");
+
+        let (outcome, logs) = mesh_ingest_capturing(&[&ev]);
+        assert!(
+            matches!(outcome, CoreOutcome::Quarantined(_)),
+            "expected Quarantined from mesh-door 39005"
+        );
+        assert!(
+            logs.contains("mesh event quarantined (relay-authored kind)"),
+            "WARN missing relay-authored class; logs:\n{logs}"
+        );
+        assert!(
+            !logs.contains("ancestry mismatch"),
+            "relay-authored quarantine mislabelled as ancestry; logs:\n{logs}"
+        );
+    }
+
+    /// The ancestry-mismatch call site: a reply whose root tag contradicts
+    /// its parent's ancestry must log the ANCESTRY class. (The
+    /// `drain_pending` mismatch site passes the same class; both share
+    /// `resolve_reply`.)
+    #[test]
+    fn mesh_root_mismatch_logs_ancestry_class() {
+        let keys = Keys::generate();
+        let root = kind9(&keys, "root", vec![]);
+        let root_id = root.id.to_hex();
+        // Parent exists, but the claimed root is wrong -> ancestry mismatch.
+        let wrong_root = "b".repeat(64);
+        let bad = kind9(
+            &keys,
+            "bad",
+            vec![e_marked(&wrong_root, "root"), e_marked(&root_id, "reply")],
+        );
+
+        let (outcome, logs) = mesh_ingest_capturing(&[&root, &bad]);
+        assert!(
+            matches!(outcome, CoreOutcome::Quarantined(_)),
+            "expected Quarantined from root-mismatched reply"
+        );
+        assert!(
+            logs.contains("mesh event quarantined (ancestry mismatch)"),
+            "WARN missing ancestry class; logs:\n{logs}"
         );
     }
 }
