@@ -105,7 +105,11 @@ fn make_state(
 
 /// POST one signed event through the real handler and return the response's
 /// `(status, body_json)`.
-async fn post_one(state: &Arc<AppState>, ev: &nostr::Event, pubkey_hex: &str) -> (u16, serde_json::Value) {
+async fn post_one(
+    state: &Arc<AppState>,
+    ev: &nostr::Event,
+    pubkey_hex: &str,
+) -> (u16, serde_json::Value) {
     let mut headers = HeaderMap::new();
     headers.insert("x-pubkey", pubkey_hex.parse().expect("header value"));
     let body = Bytes::from(ev.as_json());
@@ -184,17 +188,25 @@ async fn failed_publish_does_not_roll_back_the_commit() {
     let (status, body) = post_one(&state, &ev, &keys.public_key().to_hex()).await;
     // Publish is best-effort: the client still gets accepted:true...
     assert_eq!(status, 200, "handler status: {body}");
-    assert_eq!(body["accepted"], true, "commit must survive publish failure: {body}");
+    assert_eq!(
+        body["accepted"], true,
+        "commit must survive publish failure: {body}"
+    );
 
     // ...the publish was still attempted post-commit...
-    let observations = transport.observations.lock();
-    assert_eq!(observations.len(), 1, "publish must be attempted: {observations:?}");
-    assert!(
-        observations[0].committed_at_publish,
-        "publish attempt must follow the commit: {:?}",
-        observations[0]
-    );
-    drop(observations);
+    {
+        let observations = transport.observations.lock();
+        assert_eq!(
+            observations.len(),
+            1,
+            "publish must be attempted: {observations:?}"
+        );
+        assert!(
+            observations[0].committed_at_publish,
+            "publish attempt must follow the commit: {:?}",
+            observations[0]
+        );
+    }
 
     // ...and the event is durably stored despite the fabric never seeing it.
     let spec = FilterSpec {

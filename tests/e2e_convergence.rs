@@ -610,12 +610,7 @@ fn db_count(db: &PathBuf, sql: &str, param: &str) -> i64 {
 
 /// Poll `cond` against the bridge DB until it holds or the deadline passes.
 /// Gossip delivery is async; assertions on durable state must tolerate that.
-async fn await_db(
-    db: &PathBuf,
-    label: &str,
-    timeout: Duration,
-    cond: impl Fn(&PathBuf) -> bool,
-) {
+async fn await_db(db: &PathBuf, label: &str, timeout: Duration, cond: impl Fn(&PathBuf) -> bool) {
     let deadline = Instant::now() + timeout;
     loop {
         if cond(db) {
@@ -721,8 +716,12 @@ async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
         ClientMessage::req(SubscriptionId::new("p2-live"), vec![filter.clone()]),
     )
     .await;
-    let pre = drain_until_eose(&mut sub_ws, "p2-live", Instant::now() + Duration::from_secs(15))
-        .await;
+    let pre = drain_until_eose(
+        &mut sub_ws,
+        "p2-live",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(pre, 0, "fresh channel must be empty");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -795,11 +794,12 @@ async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
             db,
             "SELECT reply_count FROM thread_metadata WHERE event_id = ?1",
             &root_id,
-        ) == 1 && db_count(
-            db,
-            "SELECT descendant_count FROM thread_metadata WHERE event_id = ?1",
-            &root_id,
         ) == 1
+            && db_count(
+                db,
+                "SELECT descendant_count FROM thread_metadata WHERE event_id = ?1",
+                &root_id,
+            ) == 1
     })
     .await;
     // The drained reply is served from history (it is NOT re-dispatched live —
@@ -809,8 +809,12 @@ async fn e2e_mesh_door_parks_orphan_reply_then_attaches() {
         ClientMessage::req(SubscriptionId::new("p2-hist"), vec![filter.clone()]),
     )
     .await;
-    let ids = history_ids_until_eose(&mut sub_ws, "p2-hist", Instant::now() + Duration::from_secs(15))
-        .await;
+    let ids = history_ids_until_eose(
+        &mut sub_ws,
+        "p2-hist",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
     assert!(
         ids.contains(&root_id) && ids.contains(&reply_id),
         "[P2] history must serve root AND attached reply, got {ids:?}"
@@ -858,8 +862,12 @@ async fn e2e_gossip_redelivery_is_idempotent() {
         ClientMessage::req(SubscriptionId::new("p3-live"), vec![filter.clone()]),
     )
     .await;
-    let pre = drain_until_eose(&mut sub_ws, "p3-live", Instant::now() + Duration::from_secs(15))
-        .await;
+    let pre = drain_until_eose(
+        &mut sub_ws,
+        "p3-live",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(pre, 0, "fresh channel must be empty");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -973,10 +981,17 @@ async fn e2e_gossip_redelivery_is_idempotent() {
         ClientMessage::req(SubscriptionId::new("p3-hist"), vec![filter.clone()]),
     )
     .await;
-    let ids = history_ids_until_eose(&mut sub_ws, "p3-hist", Instant::now() + Duration::from_secs(15))
-        .await;
+    let ids = history_ids_until_eose(
+        &mut sub_ws,
+        "p3-hist",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await;
     let copies = ids.iter().filter(|i| *i == &reply_id).count();
-    assert_eq!(copies, 1, "history must serve exactly one copy, got {ids:?}");
+    assert_eq!(
+        copies, 1,
+        "history must serve exactly one copy, got {ids:?}"
+    );
 
     // BYTE-IDENTICAL redelivery — the common redelivery form. The fabric does
     // NOT suppress it: pubsub msg_id = H(topic, epoch_secs, peer, payload),
