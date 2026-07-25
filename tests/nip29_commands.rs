@@ -919,3 +919,110 @@ async fn seeded_general_has_a_39002_for_every_test_member() {
         1
     );
 }
+
+/// The e2e suite treats four channels as ambient — it opens `random` and
+/// `watercooler` without creating or joining them, and `stream.spec.ts` /
+/// `smoke.spec.ts` assert them by name in the sidebar's stream and forum lists.
+/// Buzz's own fixture (`setup-desktop-test-data.sh`) is not in our tree, which
+/// is exactly how the seed drifted before; pinning the whole set here means a
+/// future seed edit cannot silently drop one again.
+#[tokio::test]
+async fn the_seed_materializes_every_channel_the_suite_assumes() {
+    let (_addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+
+    let everyone: Vec<String> = x0x_nostr_bridge::seed::TEST_MEMBERS
+        .iter()
+        .map(|(_, pk)| (*pk).to_string())
+        .collect();
+    // The DM's id is derived from tyler and alice, so only those two belong in
+    // it — seeding the other two would contradict the id.
+    let dm_pair: Vec<String> = everyone[..2].to_vec();
+
+    let expected: [(String, &str, &str, &[String]); 4] = [
+        ("general".to_string(), "general", "stream", &everyone),
+        (
+            x0x_nostr_bridge::seed::channel_id("random"),
+            "random",
+            "stream",
+            &everyone,
+        ),
+        (
+            x0x_nostr_bridge::seed::channel_id("watercooler"),
+            "watercooler",
+            "forum",
+            &everyone,
+        ),
+        (
+            x0x_nostr_bridge::seed::dm_channel_id("alice-tyler"),
+            "alice-tyler",
+            "dm",
+            &dm_pair,
+        ),
+    ];
+
+    for (id, name, channel_type, members) in expected {
+        let meta = addressable(&state, KIND_META, &id)
+            .await
+            .unwrap_or_else(|| panic!("seeded channel `{name}` has no 39000"));
+        assert_eq!(tag(&meta, "name").as_deref(), Some(name));
+        assert_eq!(
+            tag(&meta, "t").as_deref(),
+            Some(channel_type),
+            "`{name}` must be typed {channel_type}: the sidebar routes it to the \
+             stream / forum / dm list off this tag alone"
+        );
+        // Every seeded channel is subject to the non-null description contract.
+        assert_eq!(tag(&meta, "about").as_deref(), Some(""));
+
+        let member_ev = addressable(&state, KIND_MEMBERS, &id)
+            .await
+            .unwrap_or_else(|| panic!("seeded channel `{name}` has no 39002"));
+        assert_eq!(
+            p_pubkeys(&member_ev),
+            members.to_vec(),
+            "the specs open `{name}` without joining, so the active identity \
+             must already be a member or the sidebar never renders it"
+        );
+    }
+}
+
+/// `random` and `watercooler` must be browsable, and the DM must not be — the
+/// list mapper decides that on the `private` tag's presence.
+#[tokio::test]
+async fn seeded_stream_and_forum_channels_are_open_and_the_dm_is_not() {
+    let (_addr, state) = spawn_real().await;
+    x0x_nostr_bridge::seed::seed_demo(&state).await.unwrap();
+
+    for name in ["random", "watercooler"] {
+        let id = x0x_nostr_bridge::seed::channel_id(name);
+        let meta = addressable(&state, KIND_META, &id).await.unwrap();
+        assert!(!has_tag(&meta, "private"), "`{name}` is a public channel");
+        assert_eq!(tag(&meta, "visibility").as_deref(), Some("open"));
+    }
+
+    let dm = addressable(
+        &state,
+        KIND_META,
+        &x0x_nostr_bridge::seed::dm_channel_id("alice-tyler"),
+    )
+    .await
+    .unwrap();
+    assert!(has_tag(&dm, "private"));
+}
+
+/// Seeded ids must not move between restarts: the specs reopen a seeded channel
+/// in a later test and the sidebar keys rows off the id.
+#[test]
+fn seeded_channel_ids_are_deterministic() {
+    let a = x0x_nostr_bridge::seed::seeded_channels();
+    let b = x0x_nostr_bridge::seed::seeded_channels();
+    assert_eq!(a, b);
+    assert_eq!(
+        x0x_nostr_bridge::seed::channel_id("random"),
+        x0x_nostr_bridge::seed::channel_id("random")
+    );
+    // `general` keeps its literal id; the bridge's own tests use it as a channel
+    // literal, so changing it would be a gratuitous break.
+    assert_eq!(a[0].0, "general");
+}
