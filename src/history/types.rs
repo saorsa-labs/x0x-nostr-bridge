@@ -73,6 +73,13 @@ pub struct IngestEffects {
     /// True when the event id was already stored (idempotent redelivery); no
     /// counters were touched.
     pub duplicate: bool,
+    /// True when this was a stale replaceable/parameterized-replaceable event
+    /// (older `created_at`, or tie with a higher id, than the stored winner):
+    /// the event was NOT stored, counters were untouched, and there are no
+    /// emits. Distinct from `duplicate` (an idempotent redelivery of THIS id).
+    /// Adapters must surface it as a stale/soft-reject so neither door
+    /// gossip-publishes, dispatches, nor fan-outs a non-stored event.
+    pub stale: bool,
     /// Roots whose 39005 summary should be re-emitted post-commit (dedup by
     /// root is the caller's job — 39005 is replaceable on `d=root`).
     pub emits: Vec<ThreadEmit>,

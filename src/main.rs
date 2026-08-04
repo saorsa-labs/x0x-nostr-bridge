@@ -21,11 +21,16 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use tokio_util::sync::CancellationToken;
 use x0x_nostr_bridge::config;
+use x0x_nostr_bridge::direct_transport::X0xDirectTransport;
 use x0x_nostr_bridge::engine_api::HistoryEngine;
 use x0x_nostr_bridge::history::HistoryStore;
 use x0x_nostr_bridge::history_adapter::{HistoryStoreEngine, HistoryStoreEventStore};
 use x0x_nostr_bridge::ingest;
+use x0x_nostr_bridge::join_policy::JoinPolicyConfig;
+use x0x_nostr_bridge::m1b;
+use x0x_nostr_bridge::media::MediaStore;
 use x0x_nostr_bridge::proto;
 use x0x_nostr_bridge::relay::{self, AppState};
 use x0x_nostr_bridge::relay_identity::RelayIdentity;
@@ -58,9 +63,64 @@ async fn main() -> anyhow::Result<()> {
         PathBuf::from(std::env::var("BRIDGE_DB").unwrap_or_else(|_| "nostr-bridge.db".to_string()));
     let (api, token) = config::resolve_api()?;
     let transport: Arc<dyn GossipTransport> = Arc::new(X0xTransport::connect(&api, &token).await?);
+    // Shutdown signal — shared by the authority worker, the direct dispatcher,
+    // and the direct transport's SSE supervisor.
+    let shutdown_cancel = CancellationToken::new();
 
-    // Bridge settings + relay identity (D4).
-    let settings = Arc::new(Settings::from_env());
+    // Bridge settings + relay identity (D4). The daemon-binding fingerprint is
+    // derived from the resolved API base (privacy: only the SHA-256 is exposed).
+    let mut settings = Settings::from_env();
+    settings.x0x_api_fingerprint = config::api_fingerprint(&api);
+    // M1b media: default the sidecar db + blob dir to siblings of BRIDGE_DB
+    // (contract §3) when no explicit path was set. This is honest *local*
+    // content-addressed storage — it never claims cross-device byte transport.
+    if settings.media_db_path.as_os_str().is_empty() {
+        settings.media_db_path = db_path.with_file_name("media.db");
+    }
+    if settings.media_dir.as_os_str().is_empty() {
+        settings.media_dir = db_path.with_file_name("media");
+    }
+    let settings = Arc::new(settings);
+    // M1b direct transport: authenticated loopback DM surface for cross-device
+    // invite-claim forwarding. Same resolved daemon API + token as the gossip
+    // transport; bounded backfill (BRIDGE_DIRECT_BACKFILL, default 64). This is
+    // best-effort — if the daemon doesn't expose the direct-message surface,
+    // remote claim forwarding is disabled and local claims still work in-process.
+    let (direct_transport, self_agent_id) = match X0xDirectTransport::connect(
+        &api,
+        &token,
+        shutdown_cancel.clone(),
+        Some(settings.direct_backfill),
+    )
+    .await
+    {
+        Ok(dt) => {
+            let arc = Arc::new(dt);
+            // Discover our own AgentId (GET /agent) — this is the `aid` that
+            // invite codes bind to and that verified result senders must equal.
+            let id = match arc.self_agent_id().await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    warn!(error = %e, "cannot resolve self agent id; remote claims disabled");
+                    None
+                }
+            };
+            (Some(arc), id)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "direct transport unavailable; remote invite claims disabled"
+            );
+            (None, None)
+        }
+    };
+    info!(
+        direct = direct_transport.is_some(),
+        self_id = self_agent_id.is_some(),
+        "direct transport"
+    );
+
     let relay_key_path = PathBuf::from(std::env::var("BRIDGE_RELAY_KEY").unwrap_or_else(|_| {
         db_path
             .with_file_name("relay.key")
@@ -97,13 +157,29 @@ async fn main() -> anyhow::Result<()> {
         transport.ensure_topic(&proto::channel_topic(&ch)).await?;
     }
 
-    let state = Arc::new(AppState::new(
-        Arc::clone(&store),
-        Arc::clone(&transport),
-        engine,
-        identity,
-        Arc::clone(&settings),
-    ));
+    // M1b: local media CAS (own sidecar + blob dir), join-policy (env), and
+    // the authority worker state (claim adjudication). Media is local CAS
+    // only — it does not transport bytes across devices.
+    let media = Arc::new(MediaStore::open(
+        &settings.media_db_path,
+        &settings.media_dir,
+        &community_fingerprint,
+    )?);
+    let join_policy = Arc::new(JoinPolicyConfig::from_env()?);
+
+    let state = Arc::new(
+        AppState::new(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            engine,
+            identity,
+            Arc::clone(&settings),
+        )
+        .with_media(media)
+        .with_join_policy(join_policy)
+        .with_authority()
+        .with_direct(direct_transport, self_agent_id),
+    );
 
     if settings.seed_demo {
         seed::seed_demo(&state).await?;
@@ -121,10 +197,28 @@ async fn main() -> anyhow::Result<()> {
 
     let app = relay::router(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!(%bind, db = %db_path.display(), "x0x-nostr-bridge listening");
+
+    // M1b authority worker: adjudicates invite claims via the in-process typed
+    // RPC channel (verified sender → apply_claim → nip29::add_member_from_invite).
+    // `Some` here because `with_authority()` was called; a claim only succeeds
+    // after the authority's typed reply — never the transport receipt.
+    let authority_worker = m1b::spawn_authority_worker(Arc::clone(&state), shutdown_cancel.clone());
+    // M1b direct dispatcher: consumes verified DMs, routes incoming remote
+    // claims to the authority worker and completes pending remote claims on
+    // verified result DMs. `Some` when a direct transport + self id are wired.
+    let direct_dispatcher =
+        m1b::spawn_direct_dispatcher(Arc::clone(&state), shutdown_cancel.clone());
+    info!(
+        %bind,
+        db = %db_path.display(),
+        authority = authority_worker.is_some(),
+        direct = direct_dispatcher.is_some(),
+        "x0x-nostr-bridge listening"
+    );
 
     // Graceful shutdown (WP3 stretch): on SIGTERM, refuse new `/` hits with 503,
-    // broadcast a 1012 Service-Restart close to every live WS, drain briefly.
+    // broadcast a 1012 Service-Restart close to every live WS, cancel the
+    // authority worker + direct dispatcher, and drain briefly.
     let shutdown_state = Arc::clone(&state);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -133,10 +227,23 @@ async fn main() -> anyhow::Result<()> {
                 .shutting_down
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             shutdown_state.shutdown.notify_waiters();
+            shutdown_cancel.cancel();
             info!("SIGTERM: draining WS connections with 1012 (relay restarting)");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         })
         .await?;
+
+    // Drain the authority worker + direct dispatcher after the HTTP server has
+    // stopped accepting, then drain the direct transport SSE supervisor.
+    if let Some(handle) = authority_worker {
+        let _ = handle.await;
+    }
+    if let Some(handle) = direct_dispatcher {
+        let _ = handle.await;
+    }
+    if let Some(dt) = &state.direct {
+        dt.join_drain().await;
+    }
     Ok(())
 }
 

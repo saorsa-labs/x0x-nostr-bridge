@@ -128,6 +128,20 @@ pub trait HistoryEngine: Send + Sync {
     async fn ingest_mesh(&self, ev: &Event) -> anyhow::Result<IngestOutcome>;
     /// Plain Nostr-filter query (feed / ids / directory / search paths).
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>>;
+    /// NIP-50 search with an optional prefix mode (Buzz `search_mode`) and a row
+    /// `offset` ((page-1)*limit, applied at storage as SQL OFFSET). `prefix ==
+    /// false` is whole-token phrase semantics; `prefix == true` makes each term a
+    /// token PREFIX (`term*`). The search ANDs every nonempty filter dimension
+    /// conjunctively. The default delegates to [`HistoryEngine::query`] (prefix
+    /// and offset ignored) so an engine with no FTS surface need not implement it.
+    async fn search(
+        &self,
+        filter: &Filter,
+        _prefix: bool,
+        _offset: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        self.query(filter).await
+    }
     /// Channel-window read-model (dialect.md §1 `top_level`).
     async fn channel_window(&self, q: &WindowQuery) -> anyhow::Result<ChannelWindow>;
     /// Thread-reply keyset page.

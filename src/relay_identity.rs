@@ -8,7 +8,9 @@
 
 use std::path::Path;
 
+use hmac::{Hmac, Mac};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
+use sha2::{Digest, Sha256};
 
 use crate::engine_api::{Cursor, ThreadSummary, WindowBounds};
 use crate::kinds;
@@ -171,6 +173,86 @@ impl RelayIdentity {
             tags.push(Tag::parse(["p", m.as_str()])?);
         }
         self.sign(kinds::KIND_MEMBERSHIP_LIST, String::new(), tags, now)
+    }
+
+    // ---- M1b invite/policy crypto helpers (contract §7/§8/§11) -------------
+
+    /// HMAC-SHA256 keyed with `SHA256(domain || secret_bytes)` over `msg`
+    /// (contract §8). The domain separator is public; the relay secret never
+    /// leaves this method. Used for policy-receipt MACs.
+    ///
+    /// Panic-free: a key-construction failure (impossible for a 32-byte
+    /// SHA-256 output) yields an empty Vec, making every downstream
+    /// constant-time comparison fail-closed.
+    pub fn mac(&self, domain: &[u8], msg: &[u8]) -> Vec<u8> {
+        let secret = self.secret_bytes();
+        // HMAC key = SHA256(domain || secret)
+        let mut key_hasher = Sha256::new();
+        key_hasher.update(domain);
+        key_hasher.update(&secret);
+        let key = key_hasher.finalize();
+        let mut mac = match Hmac::<Sha256>::new_from_slice(&key) {
+            Ok(m) => m,
+            // HMAC accepts any key length; this branch is unreachable.
+            Err(_) => return Vec::new(),
+        };
+        mac.update(msg);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    /// BIP-340 Schnorr-sign over `SHA256(payload.as_bytes())`, returning the
+    /// raw 64-byte signature (contract §7). The signature is deterministic
+    /// (no auxiliary randomness) so mint and verify never disagree. An
+    /// impossible key failure returns an empty Vec (the code will be malformed
+    /// and fail verification — fail-closed).
+    pub fn sign_invite_payload(&self, payload: &str) -> Vec<u8> {
+        let Some(secret) = self.secret_key_secp() else {
+            return Vec::new();
+        };
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let msg = Sha256::digest(payload.as_bytes());
+        let Ok(digest) = secp256k1::Message::from_digest_slice(&msg) else {
+            return Vec::new();
+        };
+        let sig = secp.sign_schnorr_no_aux_rand(&digest, &keypair);
+        sig.as_ref().to_vec()
+    }
+
+    /// Verify a BIP-340 Schnorr signature over `SHA256(payload.as_bytes())`
+    /// against the **current** authority key. Returns `false` for any
+    /// malformed input (wrong sig length, bad point, bad encoding) —
+    /// **never panics** (the invites.rs:117 total-verify contract).
+    /// Rotation ⇒ `false` for every previously-minted code.
+    pub fn verify_authority_payload(&self, payload: &str, sig: &[u8]) -> bool {
+        let Ok(signature) = secp256k1::schnorr::Signature::from_slice(sig) else {
+            return false;
+        };
+        let Some(secret) = self.secret_key_secp() else {
+            return false;
+        };
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let (pubkey, _parity) = keypair.x_only_public_key();
+        let msg = Sha256::digest(payload.as_bytes());
+        let Ok(digest) = secp256k1::Message::from_digest_slice(&msg) else {
+            return false;
+        };
+        secp.verify_schnorr(&signature, &digest, &pubkey).is_ok()
+    }
+
+    /// The relay secret as raw bytes (for HMAC keying). Panic-free: an
+    /// impossible hex-decode failure yields an empty Vec.
+    fn secret_bytes(&self) -> Vec<u8> {
+        let hex_s = self.keys.secret_key().to_secret_hex();
+        hex::decode(&hex_s).unwrap_or_default()
+    }
+
+    /// Reconstruct the underlying secp256k1 SecretKey from the nostr key's
+    /// hex form. `None` on any failure (impossible for a valid key, but kept
+    /// panic-free).
+    fn secret_key_secp(&self) -> Option<secp256k1::SecretKey> {
+        secp256k1::SecretKey::from_slice(&self.secret_bytes()).ok()
     }
 }
 

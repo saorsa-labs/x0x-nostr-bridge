@@ -6,6 +6,7 @@
 //! `transport`/`config`.
 
 use crate::filter_match::AccessPolicy;
+use std::path::PathBuf;
 
 /// Default global WS connection cap (issue #2).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -40,6 +41,41 @@ pub struct Settings {
     /// Default `false` so the WS-only spike tests (which sign a loopback relay
     /// tag) are unaffected; `from_env` turns it on for production.
     pub enforce_relay_tag: bool,
+    /// Lowercase-hex SHA-256 of the normalized x0x daemon API base the bridge
+    /// resolved at startup (empty when unset, e.g. tests). Published in the
+    /// NIP-11 `/info` doc as `x0x_api_fingerprint` so a caller can verify the
+    /// daemon binding without the bridge exposing the daemon's address.
+    pub x0x_api_fingerprint: String,
+    // ---- M1b media / invite / join-policy settings (contract §3) ----
+    /// Media blob directory (BRIDGE_MEDIA_DIR). Default: sibling of BRIDGE_DB
+    /// (computed in main.rs).
+    pub media_dir: PathBuf,
+    /// Media sidecar SQLite path (BRIDGE_MEDIA_DB). Default: sibling of BRIDGE_DB.
+    pub media_db_path: PathBuf,
+    /// Public base URL for media descriptor `url`/`thumb` (empty ⇒ public_base_url).
+    pub media_public_base_url: String,
+    /// Per-type upload byte caps (§3).
+    pub media_max_image_bytes: u64,
+    pub media_max_gif_bytes: u64,
+    /// Absolute route body cap (the largest per-type cap).
+    pub media_max_video_bytes: u64,
+    pub media_max_file_bytes: u64,
+    /// Blossom 24242 auth-event freshness windows (seconds).
+    pub media_upload_auth_max_age_secs: u64,
+    pub media_video_auth_max_age_secs: u64,
+    pub media_get_auth_max_age_secs: u64,
+    /// Require Blossom kind-24242 `get` auth (default false; fail-open).
+    pub require_media_get_auth: bool,
+    /// Bootstrap community admins (BRIDGE_COMMUNITY_ADMINS, comma-sep hex).
+    pub community_admins: Vec<String>,
+    /// Primary channel for invite-claim membership
+    /// (BRIDGE_COMMUNITY_PRIMARY_CHANNEL; empty ⇒ seed::channel_id("general")).
+    pub community_primary_channel: String,
+    /// Default invite TTL when the client omits `ttl_secs`.
+    pub invite_default_ttl_secs: u64,
+    /// Bounded direct-message backfill on (re)connect
+    /// (BRIDGE_DIRECT_BACKFILL). Default 64; clamped to 256 by the transport.
+    pub direct_backfill: usize,
 }
 
 impl Default for Settings {
@@ -54,6 +90,22 @@ impl Default for Settings {
             access: AccessPolicy::default(),
             seed_demo: false,
             enforce_relay_tag: false,
+            x0x_api_fingerprint: String::new(),
+            media_dir: PathBuf::new(),
+            media_db_path: PathBuf::new(),
+            media_public_base_url: String::new(),
+            media_max_image_bytes: 50 * 1024 * 1024,
+            media_max_gif_bytes: 10 * 1024 * 1024,
+            media_max_video_bytes: 524_288_000,
+            media_max_file_bytes: 104_857_600,
+            media_upload_auth_max_age_secs: 600,
+            media_video_auth_max_age_secs: 3600,
+            media_get_auth_max_age_secs: 3600,
+            require_media_get_auth: false,
+            community_admins: Vec::new(),
+            community_primary_channel: String::new(),
+            invite_default_ttl_secs: 86_400,
+            direct_backfill: 64,
         }
     }
 }
@@ -94,6 +146,36 @@ impl Settings {
         if let Ok(v) = std::env::var("BRIDGE_RATE_LIMIT_PER_MIN") {
             if let Ok(n) = v.trim().parse::<u32>() {
                 s.rate_limit_per_min = if n == 0 { None } else { Some(n) };
+            }
+        }
+        // ---- M1b media / invite env overrides (contract §3) ----
+        if let Ok(v) = std::env::var("BRIDGE_MEDIA_DIR") {
+            if !v.trim().is_empty() {
+                s.media_dir = PathBuf::from(v.trim());
+            }
+        }
+        if let Ok(v) = std::env::var("BRIDGE_MEDIA_DB") {
+            if !v.trim().is_empty() {
+                s.media_db_path = PathBuf::from(v.trim());
+            }
+        }
+        s.require_media_get_auth =
+            env_bool("BUZZ_REQUIRE_MEDIA_GET_AUTH", s.require_media_get_auth);
+        if let Ok(v) = std::env::var("BRIDGE_COMMUNITY_ADMINS") {
+            s.community_admins = v
+                .split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("BRIDGE_COMMUNITY_PRIMARY_CHANNEL") {
+            if !v.trim().is_empty() {
+                s.community_primary_channel = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("BRIDGE_DIRECT_BACKFILL") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                s.direct_backfill = n;
             }
         }
         s

@@ -29,6 +29,7 @@ pub fn document(settings: &Settings, identity: &RelayIdentity) -> serde_json::Va
         "version": env!("CARGO_PKG_VERSION"),
         "supported_nips": supported_nips,
         "self": identity.public_key_hex(),
+        "x0x_api_fingerprint": settings.x0x_api_fingerprint,
         "supported_extensions": ["nip-er"],
         "limitation": {
             "max_message_length": proto::MAX_FRAME_BYTES,

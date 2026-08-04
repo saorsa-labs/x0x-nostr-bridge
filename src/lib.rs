@@ -7,13 +7,18 @@
 //! (see each module's doc comment).
 pub mod auth;
 pub mod config;
+pub mod direct_transport;
 pub mod engine_api;
 pub mod filter_match;
 pub mod history;
 pub mod history_adapter;
 pub mod http;
 pub mod ingest;
+pub mod invites;
+pub mod join_policy;
 pub mod kinds;
+pub mod m1b;
+pub mod media;
 pub mod nip11;
 pub mod nip29;
 pub mod proto;

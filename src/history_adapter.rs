@@ -72,6 +72,19 @@ fn from_window_bounds(b: history::WindowBounds) -> WindowBounds {
     }
 }
 
+/// True when `f` carries an empty `Some`-set (ids/authors/kinds/generic tag),
+/// which matches NOTHING. Both the search and non-search query branches must
+/// fail closed on this: an empty `Some([])` is not "unconstrained" — an empty
+/// kinds list is NOT "any kind", an empty `#x` is NOT "ignore #x". Widening it
+/// would over-match (the original search-arm defect: it passed `kinds:[]` to
+/// the store as "any kind" and returned real hits).
+fn has_empty_set(f: &Filter) -> bool {
+    f.ids.as_ref().is_some_and(|s| s.is_empty())
+        || f.authors.as_ref().is_some_and(|s| s.is_empty())
+        || f.kinds.as_ref().is_some_and(|s| s.is_empty())
+        || f.generic_tags.values().any(|s| s.is_empty())
+}
+
 /// Map a nostr `Filter` onto WP1b's `FilterSpec`. Returns `None` when the filter
 /// carries an empty `Some`-set (matches nothing) — the caller must return an
 /// empty result rather than an unconstrained query (FilterSpec empty vec =
@@ -82,11 +95,7 @@ fn from_window_bounds(b: history::WindowBounds) -> WindowBounds {
 /// [`run_query`]). Nothing may be dropped here: an unevaluated dimension does
 /// not fail closed, it over-matches.
 fn to_filter_spec(f: &Filter) -> Option<FilterSpec> {
-    if f.ids.as_ref().is_some_and(|s| s.is_empty())
-        || f.authors.as_ref().is_some_and(|s| s.is_empty())
-        || f.kinds.as_ref().is_some_and(|s| s.is_empty())
-        || f.generic_tags.values().any(|s| s.is_empty())
-    {
+    if has_empty_set(f) {
         return None;
     }
     let mut spec = FilterSpec::default();
@@ -128,27 +137,32 @@ fn e_kinds_spec(e: Vec<String>, kinds: Vec<u32>) -> FilterSpec {
 /// empty-`Some`-set-means-nothing rule. `exclude_kinds` is the p-gated set,
 /// enforced at the STORE layer for NIP-50 search (Buzz nulls their search
 /// vector) — the HTTP layer keeps its own post-filter as belt-and-braces.
+/// `offset` is the row offset ((page-1)*limit) applied at storage as SQL
+/// OFFSET, never fetch-head-then-drain. `prefix` selects token-prefix matching
+/// for the search branch (Buzz `search_mode:"prefix"`); ignored otherwise.
+///
+/// Both branches run the SAME FilterSpec, so the search path ANDs every nonempty
+/// dimension (ids/authors/kinds/since/until/generic tags) conjunctively with the
+/// FTS match — it no longer drops them.
 async fn run_query(
     store: &HistoryStore,
     filter: &Filter,
     exclude_kinds: &[u32],
+    offset: usize,
+    prefix: bool,
 ) -> anyhow::Result<Vec<Event>> {
     let limit = filter.limit.unwrap_or(QUERY_MAX_LIMIT).min(QUERY_MAX_LIMIT);
-    if let Some(search) = &filter.search {
-        let kinds: Vec<u32> = filter
-            .kinds
-            .as_ref()
-            .map(|k| k.iter().map(|k| u32::from(k.as_u16())).collect())
-            .unwrap_or_default();
-        let channel = proto::filter_channels(filter).into_iter().next();
-        return store
-            .search(search, &kinds, channel.as_deref(), exclude_kinds, limit)
-            .await;
-    }
+    // to_filter_spec returns None for an empty `Some([])` (matches nothing), so
+    // BOTH branches fail closed on it — no separate search-arm guard needed.
     let Some(spec) = to_filter_spec(filter) else {
         return Ok(Vec::new());
     };
-    store.query(&spec, limit, 0).await
+    if let Some(search) = &filter.search {
+        return store
+            .search_with_prefix(search, &spec, exclude_kinds, limit, offset, prefix)
+            .await;
+    }
+    store.query(&spec, limit, offset).await
 }
 
 /// HTTP-lane engine over the durable history store.
@@ -200,6 +214,10 @@ impl HistoryEngine for HistoryStoreEngine {
             history::LocalIngest::Accepted(e) if e.duplicate => IngestOutcome::Duplicate {
                 event_id: ev.id.to_hex(),
             },
+            history::LocalIngest::Accepted(e) if e.stale => IngestOutcome::SoftReject {
+                event_id: ev.id.to_hex(),
+                message: "duplicate: replaced".to_string(),
+            },
             history::LocalIngest::Accepted(e) => IngestOutcome::Stored {
                 event_id: ev.id.to_hex(),
                 emits: map_emits(e.emits),
@@ -213,6 +231,10 @@ impl HistoryEngine for HistoryStoreEngine {
             history::MeshIngest::Accepted(e) if e.duplicate => IngestOutcome::Duplicate {
                 event_id: ev.id.to_hex(),
             },
+            history::MeshIngest::Accepted(e) if e.stale => IngestOutcome::SoftReject {
+                event_id: ev.id.to_hex(),
+                message: "duplicate: replaced".to_string(),
+            },
             history::MeshIngest::Accepted(e) => IngestOutcome::Stored {
                 event_id: ev.id.to_hex(),
                 emits: map_emits(e.emits),
@@ -225,7 +247,16 @@ impl HistoryEngine for HistoryStoreEngine {
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        run_query(&self.store, filter, &self.p_gated).await
+        run_query(&self.store, filter, &self.p_gated, 0, false).await
+    }
+
+    async fn search(
+        &self,
+        filter: &Filter,
+        prefix: bool,
+        offset: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        run_query(&self.store, filter, &self.p_gated, offset, prefix).await
     }
 
     async fn channel_window(&self, q: &WindowQuery) -> anyhow::Result<ChannelWindow> {
@@ -336,15 +367,29 @@ impl HistoryStoreEventStore {
 #[async_trait]
 impl EventStore for HistoryStoreEventStore {
     async fn insert(&self, ev: &Event) -> anyhow::Result<InsertOutcome> {
+        Ok(self.insert_with_emits(ev).await?.0)
+    }
+
+    /// Plumb the HistoryStore ingest emits (roots whose relay-signed 39005 must
+    /// be re-emitted post-commit) through the WS-door result, closing the
+    /// M1a-WIRING gap ("live 39005 fan-out for WS-submitted replies is handled
+    /// on the gossip/HTTP doors, not here"). A single `ingest_local` drives both
+    /// the outcome and the emits; `insert` is the emits-discarding view.
+    async fn insert_with_emits(&self, ev: &Event) -> anyhow::Result<(InsertOutcome, Vec<Emit>)> {
         match self.store.ingest_local(ev).await? {
-            history::LocalIngest::Accepted(e) if e.duplicate => Ok(InsertOutcome::Duplicate),
-            history::LocalIngest::Accepted(_) => Ok(InsertOutcome::Inserted),
+            history::LocalIngest::Accepted(e) if e.duplicate => {
+                Ok((InsertOutcome::Duplicate, Vec::new()))
+            }
+            history::LocalIngest::Accepted(e) if e.stale => {
+                Ok((InsertOutcome::StaleRejected, Vec::new()))
+            }
+            history::LocalIngest::Accepted(e) => Ok((InsertOutcome::Inserted, map_emits(e.emits))),
             history::LocalIngest::Rejected(reason) => Err(anyhow::anyhow!(reason)),
         }
     }
 
     async fn query(&self, filter: &Filter) -> anyhow::Result<Vec<Event>> {
-        run_query(&self.store, filter, &self.p_gated).await
+        run_query(&self.store, filter, &self.p_gated, 0, false).await
     }
 
     async fn known_channels(&self) -> anyhow::Result<Vec<String>> {

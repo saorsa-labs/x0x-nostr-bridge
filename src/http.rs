@@ -110,6 +110,33 @@ fn thread_cursor(raw: &Value) -> Option<Cursor> {
     })
 }
 
+/// Parse the Buzz `search_mode` extension field (dialect.md). Absent or null →
+/// `false` (current whole-token phrase semantics, unchanged). `"prefix"` →
+/// `true` (FTS5 token-prefix match for typeahead). Any other string or a
+/// non-string yields `Err(message)` for a fail-closed 400 — consistent with the
+/// existing malformed-query taxonomy (e.g. mixed search/non-search).
+fn parse_search_mode(raw: &Value) -> Result<bool, String> {
+    match raw.get("search_mode") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s == "prefix" => Ok(true),
+        Some(Value::String(s)) => Err(format!("unknown search_mode: {s}")),
+        Some(_) => Err("search_mode must be a string".to_string()),
+    }
+}
+
+/// Row offset for plain-path paging: `(page - 1) * limit`. 0 when `page` or
+/// `limit` is absent/zero (paging is a no-op without a per-page limit). Pushed
+/// to storage as SQL OFFSET — never fetch-head-then-drain.
+fn page_offset(raw: &Value) -> usize {
+    match (
+        raw.get("page").and_then(Value::as_u64),
+        raw.get("limit").and_then(Value::as_u64),
+    ) {
+        (Some(page), Some(limit)) if limit > 0 => page.saturating_sub(1) as usize * limit as usize,
+        _ => 0,
+    }
+}
+
 // ---- POST /events ----------------------------------------------------------
 
 pub async fn post_events(
@@ -123,7 +150,7 @@ pub async fn post_events(
     // mode; the dev-auth X-Pubkey path ignores it.
     let principal = match auth::authenticate(
         &state.settings,
-        &state.replay,
+        state.replay.as_ref(),
         &headers,
         "POST",
         "/events",
@@ -238,6 +265,14 @@ pub(crate) async fn fan_out_group_state(state: &Arc<AppState>, events: &[Event])
 /// reported as mutated, recompute its summary and dispatch the relay-signed
 /// 39005 (covers both the reply and delete paths). Fire-and-forget; a dropped
 /// emit is corrected by the next reply or by a window's `include_summaries`.
+///
+/// The overlay is dispatched to live WS subscribers only — it is NOT published
+/// to the gossip fabric. The single-pod x0x bridge has no cross-pod fan-out
+/// analog (the reference relay's Redis `EventTopic::Channel` reached its own
+/// pods), peer relays reject relay-authored kinds at mesh ingest, and skipping
+/// the publish guarantees zero fabric loopback by construction. The original
+/// event is still gossip-published at its ingest door, so peer relays compute
+/// and fan out their own 39005 independently.
 pub(crate) fn fan_out_emits(state: &Arc<AppState>, emits: Vec<crate::engine_api::Emit>) {
     for emit in emits {
         let Some(channel) = emit.channel_id else {
@@ -248,7 +283,6 @@ pub(crate) fn fan_out_emits(state: &Arc<AppState>, emits: Vec<crate::engine_api:
         tokio::spawn(async move {
             if let Ok(Some(summary)) = state.engine.thread_summary(&channel, &root).await {
                 if let Ok(overlay) = state.identity.thread_summary_event(&summary, now_secs()) {
-                    publish_to_topics(&state.transport, &overlay).await;
                     state.hub.dispatch(&overlay);
                 }
             }
@@ -266,7 +300,7 @@ pub async fn post_query(
     let now = now_secs();
     let principal = match auth::authenticate(
         &state.settings,
-        &state.replay,
+        state.replay.as_ref(),
         &headers,
         "POST",
         "/query",
@@ -295,6 +329,17 @@ pub async fn post_query(
         return api_error(400, "mixed search and non-search filters not supported");
     }
 
+    // Buzz `search_mode` extension (dialect.md): resolve per-filter up front so
+    // an unknown/malformed mode is a fail-closed 400 regardless of which path
+    // the request takes (window / thread / plain). Absent or null → literal.
+    let mut prefixes = Vec::with_capacity(raws.len());
+    for raw in &raws {
+        match parse_search_mode(raw) {
+            Ok(prefix) => prefixes.push(prefix),
+            Err(msg) => return api_error(400, &msg),
+        }
+    }
+
     // Read access classes (p-gated / engram / author-only → 403).
     for raw in &raws {
         if let Err(d) = filter_match::authorize(&state.settings.access, raw, &principal.pubkey_hex)
@@ -316,7 +361,7 @@ pub async fn post_query(
     // Plain / search / ids / directory path — bare event array, no overlays.
     let mut out: Vec<Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for raw in &raws {
+    for (raw, prefix) in raws.iter().zip(&prefixes) {
         // Presence-only filters are answered empty, never hitting storage.
         if filter_match::is_presence_only(&state.settings.access, raw) {
             continue;
@@ -328,7 +373,8 @@ pub async fn post_query(
                 continue;
             }
         };
-        let mut events = match state.engine.query(&filter).await {
+        let offset = page_offset(raw);
+        let mut events = match state.engine.search(&filter, *prefix, offset).await {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(error = %e, "engine query failed");
@@ -348,19 +394,6 @@ pub async fn post_query(
                     ev.kind.as_u16(),
                 )
             });
-        }
-        // Offset paging (`page` > 1) + limit truncation for the plain path.
-        if let Some(page) = raw.get("page").and_then(Value::as_u64) {
-            let limit = raw.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let offset = page.saturating_sub(1) as usize * limit;
-            if offset < events.len() {
-                events.drain(0..offset);
-            } else {
-                events.clear();
-            }
-        }
-        if let Some(limit) = raw.get("limit").and_then(Value::as_u64) {
-            events.truncate(limit as usize);
         }
         for ev in events {
             if seen.insert(ev.id.to_hex()) {
@@ -521,7 +554,7 @@ pub async fn post_count(
     let now = now_secs();
     let principal = match auth::authenticate(
         &state.settings,
-        &state.replay,
+        state.replay.as_ref(),
         &headers,
         "POST",
         "/count",

@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -174,7 +174,20 @@ pub struct AppState {
     pub engine: Arc<dyn HistoryEngine>,
     pub identity: Arc<RelayIdentity>,
     pub settings: Arc<Settings>,
-    pub replay: ReplayCache,
+    pub replay: Arc<ReplayCache>,
+    /// M1b join-policy config (default disabled; overridden in main.rs).
+    pub join_policy: Arc<crate::join_policy::JoinPolicyConfig>,
+    /// M1b media blob store (None when media is not configured / in tests).
+    pub media: Option<Arc<crate::media::MediaStore>>,
+    /// M1b authority bus state (None when invite claims are not configured).
+    pub authority: Option<crate::m1b::AuthorityState>,
+    /// M1b direct-message transport for cross-device claim forwarding
+    /// (None when not configured / in tests).
+    pub direct: Option<Arc<crate::direct_transport::X0xDirectTransport>>,
+    /// This daemon's AgentId from GET /agent (None when no direct transport).
+    pub self_agent_id: Option<crate::direct_transport::AgentId>,
+    /// Shared direct-bus state (pending remote claims). None without transport.
+    pub direct_bus: Option<crate::m1b::DirectBusState>,
     pub limiter: RateLimiter,
     /// Global WS connection cap permits (issue #2).
     pub conn_sem: Arc<Semaphore>,
@@ -204,7 +217,13 @@ impl AppState {
             engine,
             identity,
             settings,
-            replay: ReplayCache::new(),
+            replay: Arc::new(ReplayCache::new()),
+            join_policy: Arc::new(crate::join_policy::JoinPolicyConfig::disabled()),
+            media: None,
+            authority: None,
+            direct: None,
+            self_agent_id: None,
+            direct_bus: None,
             limiter: RateLimiter::new(),
             conn_sem,
             topic_refs: DashMap::new(),
@@ -234,6 +253,48 @@ impl AppState {
     /// enforced, membership off) so the WS-only spike tests behave as before.
     pub fn with_defaults(store: Arc<dyn EventStore>, transport: Arc<dyn GossipTransport>) -> Self {
         Self::for_test(store, transport, Settings::default())
+    }
+
+    // ---- M1b startup builders (production wiring; default = off) ----
+
+    /// Enable the M1b authority worker (invite-claim adjudication). Creates
+    /// the bounded authority state + work channel; the caller spawns the
+    /// worker via [`crate::m1b::spawn_authority_worker`] after wrapping the
+    /// state in `Arc`. Without this, `/api/invites/claim` times out → 502.
+    pub fn with_authority(mut self) -> Self {
+        self.authority = Some(crate::m1b::AuthorityState::new());
+        self
+    }
+
+    /// Wire the M1b direct-message transport for cross-device invite claims.
+    /// Stores the transport + self AgentId and creates the shared direct-bus
+    /// state (pending remote claims). The caller spawns the dispatcher via
+    /// [`crate::m1b::spawn_direct_dispatcher`] after wrapping in `Arc`. Both
+    /// arguments must be `Some` together (or both `None` to disable).
+    pub fn with_direct(
+        mut self,
+        direct: Option<Arc<crate::direct_transport::X0xDirectTransport>>,
+        self_agent_id: Option<crate::direct_transport::AgentId>,
+    ) -> Self {
+        if direct.is_some() && self_agent_id.is_some() {
+            self.direct_bus = Some(crate::m1b::DirectBusState::new());
+        }
+        self.direct = direct;
+        self.self_agent_id = self_agent_id;
+        self
+    }
+
+    /// Configure the M1b media blob store (local content-addressed CAS). When
+    /// set, the router mounts the PUT/GET/HEAD media routes.
+    pub fn with_media(mut self, media: Arc<crate::media::MediaStore>) -> Self {
+        self.media = Some(media);
+        self
+    }
+
+    /// Configure the M1b join-policy (served at `/api/join-policy*`).
+    pub fn with_join_policy(mut self, policy: Arc<crate::join_policy::JoinPolicyConfig>) -> Self {
+        self.join_policy = policy;
+        self
     }
 
     fn acquire_topics(&self, conn: ConnId, sub_id: &str, topics: Vec<String>) {
@@ -298,15 +359,69 @@ impl AppState {
 /// CORS preflight. The relay binds loopback and authenticates per request, so
 /// any-origin is acceptable here; native Tauri clients are unaffected.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Authority bus Extension: always provided so the claim handler can
+    // extract it. If state.authority is None (tests / no worker), claims
+    // time out → 502 (honest: the authority is not running).
+    let auth_state = state
+        .authority
+        .clone()
+        .unwrap_or_else(crate::m1b::AuthorityState::new);
+    let bus = std::sync::Arc::new(crate::m1b::LocalAuthorityBus::new(auth_state));
+
+    // Dialect + invite/policy router (1 MiB body limit).
+    let dialect = Router::new()
         .route("/", get(root_handler))
         .route("/events", post(crate::http::post_events))
         .route("/query", post(crate::http::post_query))
         .route("/count", post(crate::http::post_count))
         .route("/info", get(crate::http::get_info))
-        .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+        // M1b invite / join-policy routes (NIP-98 auth in-handler).
+        .route("/api/invites", post(crate::m1b::post_invites))
+        .route(
+            "/api/invites/accept-policy",
+            post(crate::m1b::post_accept_policy),
+        )
+        .route("/api/invites/claim", post(crate::m1b::post_claim))
+        .route("/api/join-policy", get(crate::m1b::get_join_policy))
+        .route("/api/join-policy/terms", get(crate::m1b::get_policy_terms))
+        .route(
+            "/api/join-policy/privacy",
+            get(crate::m1b::get_policy_privacy),
+        )
+        .layer(Extension(bus))
+        .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT));
+
+    // Media router (large body limit) — only if a media store is configured.
+    let app = if let Some(media_store) = state.media.clone() {
+        let upload_state = crate::m1b::build_upload_state(&state, media_store.clone());
+        let media_serve = crate::m1b::build_media_serve(&state, media_store);
+        let replay_guard = std::sync::Arc::new(crate::m1b::SharedReplayGuard(
+            std::sync::Arc::clone(&state.replay),
+        ));
+        let member_check = std::sync::Arc::new(crate::m1b::EngineMemberCheck(
+            std::sync::Arc::clone(&state.engine),
+        ));
+
+        let media = Router::new()
+            .route("/upload", put(crate::media::upload::put_upload))
+            .route("/media/upload", put(crate::media::upload::put_upload))
+            .route(
+                "/media/*path",
+                get(crate::m1b::get_media).head(crate::m1b::head_media),
+            )
+            .layer(Extension(upload_state))
+            .layer(Extension(media_serve))
+            .layer(Extension(replay_guard))
+            .layer(Extension(member_check))
+            .layer(DefaultBodyLimit::max(
+                state.settings.media_max_video_bytes as usize,
+            ));
+        dialect.merge(media)
+    } else {
+        dialect
+    };
+
+    app.layer(CorsLayer::permissive()).with_state(state)
 }
 
 async fn root_handler(
@@ -578,16 +693,21 @@ async fn handle_event(
         }
     }
 
-    match state.store.insert(&ev).await {
-        Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
+    match state.store.insert_with_emits(&ev).await {
+        Ok((InsertOutcome::Inserted | InsertOutcome::Replaced, emits)) => {
             publish_to_topics(&state.transport, &ev).await;
             state.hub.dispatch(&ev);
+            // Post-commit: recompute + dispatch the relay-signed kind-39005 for
+            // each mutated root. Fire-and-forget; closes the gap where a
+            // WS-submitted reply's summary was only fanned out on the
+            // gossip/HTTP doors.
+            crate::http::fan_out_emits(state, emits);
             let _ = tx.send(RelayMessage::ok(ev.id, true, "")).await;
         }
-        Ok(InsertOutcome::Duplicate) => {
+        Ok((InsertOutcome::Duplicate, _)) => {
             let _ = tx.send(RelayMessage::ok(ev.id, true, "duplicate:")).await;
         }
-        Ok(InsertOutcome::StaleRejected) => {
+        Ok((InsertOutcome::StaleRejected, _)) => {
             let _ = tx
                 .send(RelayMessage::ok(ev.id, false, "duplicate: replaced"))
                 .await;

@@ -91,6 +91,7 @@ pub(crate) fn ingest_event(
     if event_exists(tx, &id)? {
         return Ok(CoreOutcome::Accepted(IngestEffects {
             duplicate: true,
+            stale: false,
             emits: Vec::new(),
         }));
     }
@@ -124,6 +125,7 @@ pub(crate) fn ingest_event(
         drain_pending(tx, &id, now, &mut emits)?;
         return Ok(CoreOutcome::Accepted(IngestEffects {
             duplicate: false,
+            stale: false,
             emits,
         }));
     }
@@ -137,6 +139,7 @@ pub(crate) fn ingest_event(
                 drain_pending(tx, &id, now, &mut emits)?;
                 Ok(CoreOutcome::Accepted(IngestEffects {
                     duplicate: false,
+                    stale: false,
                     emits,
                 }))
             }
@@ -165,6 +168,7 @@ pub(crate) fn ingest_event(
                         drain_pending(tx, &id, now, &mut emits)?;
                         Ok(CoreOutcome::Accepted(IngestEffects {
                             duplicate: false,
+                            stale: false,
                             emits,
                         }))
                     }
@@ -175,12 +179,19 @@ pub(crate) fn ingest_event(
         // Every other kind is stored opaquely (with replaceable dedup for
         // replaceable client kinds) as a top-level channel message.
         let outcome = insert_deduped(tx, ev, &id, channel_id.as_deref())?;
+        // A stale replaceable/parameterized-replaceable (older than the stored
+        // winner, or a tie with a higher id) is NOT stored. Flag it so the
+        // adapters surface a stale/soft-reject instead of a fresh store — the
+        // prior code mapped StaleRejected to Accepted{duplicate:false}, which
+        // made both doors gossip-publish/dispatch/fan-out a non-stored event.
+        let stale = outcome == RelayStoreOutcome::StaleRejected;
         let mut emits = Vec::new();
-        if outcome != RelayStoreOutcome::StaleRejected {
+        if !stale {
             drain_pending(tx, &id, now, &mut emits)?;
         }
         Ok(CoreOutcome::Accepted(IngestEffects {
             duplicate: false,
+            stale,
             emits,
         }))
     }
@@ -520,6 +531,7 @@ fn delete_flow(
     drain_pending(tx, id, now, &mut emits)?;
     Ok(CoreOutcome::Accepted(IngestEffects {
         duplicate: false,
+        stale: false,
         emits,
     }))
 }

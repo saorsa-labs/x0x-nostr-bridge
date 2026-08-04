@@ -163,7 +163,9 @@ impl HistoryStore {
 
     /// NIP-50 FTS search over event content. `kinds` narrows (empty = any),
     /// `channel` scopes to a `#h`, `exclude_kinds` removes kinds that must stay
-    /// unsearchable (WP2's p-gated set). Order `created_at DESC, id ASC`.
+    /// unsearchable (WP2's p-gated set). Whole-token phrase semantics. Order
+    /// `created_at DESC, id ASC`. Test-facing 5-arg form — delegates to
+    /// [`HistoryStore::search_with_prefix`] (no offset).
     pub async fn search(
         &self,
         text: &str,
@@ -172,23 +174,34 @@ impl HistoryStore {
         exclude_kinds: &[u32],
         limit: usize,
     ) -> Result<Vec<Event>> {
-        let (text, kinds, channel, exclude_kinds) = (
-            text.to_string(),
-            kinds.to_vec(),
-            channel.map(str::to_string),
-            exclude_kinds.to_vec(),
-        );
+        let spec = FilterSpec {
+            kinds: kinds.to_vec(),
+            ..FilterSpec::default()
+        }
+        .with_tag("h", channel.into_iter().map(str::to_string));
+        self.search_with_prefix(text, &spec, exclude_kinds, limit, 0, false)
+            .await
+    }
+
+    /// As [`HistoryStore::search`], but over an arbitrary [`FilterSpec`] — every
+    /// nonempty dimension (ids/authors/kinds/since/until/every generic tag) ANDs
+    /// the FTS result conjunctively at storage — with a row `offset` and the
+    /// Buzz `search_mode:"prefix"` token-prefix match (`prefix == false` is
+    /// whole-token phrase semantics).
+    pub async fn search_with_prefix(
+        &self,
+        text: &str,
+        f: &FilterSpec,
+        exclude_kinds: &[u32],
+        limit: usize,
+        offset: usize,
+        prefix: bool,
+    ) -> Result<Vec<Event>> {
+        let (text, f, exclude_kinds) = (text.to_string(), f.clone(), exclude_kinds.to_vec());
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || -> Result<Vec<Event>> {
             let guard = lock(&conn)?;
-            query::search(
-                &guard,
-                &text,
-                &kinds,
-                channel.as_deref(),
-                &exclude_kinds,
-                limit,
-            )
+            query::search(&guard, &text, &f, &exclude_kinds, limit, offset, prefix)
         })
         .await
         .map_err(|e| anyhow!("search task failed: {e}"))?

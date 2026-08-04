@@ -29,10 +29,21 @@ fn placeholders(n: usize) -> String {
 
 /// Build a safe FTS5 MATCH expression: split on whitespace, escape inner double
 /// quotes, wrap each token as a phrase (AND of the terms). "" for blank input.
-fn fts_match_expr(search: &str) -> String {
+/// `prefix` appends FTS5's phrase-prefix operator (`"token"*`) to each term so a
+/// partially-typed query matches any indexed token beginning with it — the Buzz
+/// `search_mode:"prefix"` typeahead surface. Literal mode leaves each phrase
+/// exact (whole-token match), unchanged from prior behavior.
+fn fts_match_expr(search: &str, prefix: bool) -> String {
     search
         .split_whitespace()
-        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .map(|tok| {
+            let phrase = format!("\"{}\"", tok.replace('"', "\"\""));
+            if prefix {
+                format!("{phrase}*")
+            } else {
+                phrase
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -208,36 +219,36 @@ pub(crate) fn count(conn: &Connection, f: &FilterSpec) -> Result<u64> {
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
-/// NIP-50 FTS search over event content. Optional `kinds` allowlist and
-/// `channel` (`#h`) scope; `exclude_kinds` removes kinds that must be
-/// unsearchable (WP2 passes its p-gated set — p-gated content must never surface
-/// via search, per buzz_core). Order `created_at DESC, id ASC`; limit capped.
+/// NIP-50 FTS search over event content, conjunctive with EVERY nonempty
+/// [`FilterSpec`] dimension (ids/authors/kinds/since/until/every generic tag,
+/// incl `#h`/`#p`) — applied via [`build_where`] at storage, so a search that
+/// carries these narrows instead of over-matching, and LIMIT/OFFSET apply to
+/// the filtered set (no post-filter under-fetch). `exclude_kinds` removes the
+/// WP2 p-gated set (kinds that must stay unsearchable). `prefix` selects
+/// token-prefix matching (Buzz `search_mode:"prefix"`); `false` is whole-token
+/// phrase semantics. Order `created_at DESC, id ASC`; limit capped.
 pub(crate) fn search(
     conn: &Connection,
     text: &str,
-    kinds: &[u32],
-    channel: Option<&str>,
+    f: &FilterSpec,
     exclude_kinds: &[u32],
     limit: usize,
+    offset: usize,
+    prefix: bool,
 ) -> Result<Vec<Event>> {
-    let fts = fts_match_expr(text);
+    let fts = fts_match_expr(text, prefix);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
     let limit = limit.min(proto::MAX_FILTER_LIMIT);
 
-    let mut where_parts: Vec<String> = vec![
-        "e.deleted = 0".to_string(),
-        "e.rowid IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)".to_string(),
-    ];
-    let mut params: Vec<SqlValue> = vec![SqlValue::from(fts)];
-
-    push_in_clause(
-        &mut where_parts,
-        &mut params,
-        "e.kind",
-        kinds.iter().map(|k| SqlValue::from(i64::from(*k))),
-    );
+    // build_where yields `deleted = 0` + one clause per nonempty dimension;
+    // the FTS MATCH ANDs on top, so all dims are honored conjunctively.
+    let (mut where_parts, mut params) = build_where(f);
+    where_parts
+        .push("e.rowid IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)".to_string());
+    params.push(SqlValue::from(fts));
+    // p-gated exclusion is separate from FilterSpec (WP2's unsearchable set).
     if !exclude_kinds.is_empty() {
         where_parts.push(format!(
             "e.kind NOT IN ({})",
@@ -247,21 +258,13 @@ pub(crate) fn search(
             params.push(SqlValue::from(i64::from(*k)));
         }
     }
-    if let Some(ch) = channel {
-        push_tag_clause(
-            &mut where_parts,
-            &mut params,
-            "h",
-            std::slice::from_ref(&ch.to_string()),
-            true,
-        );
-    }
 
     let sql = format!(
         "SELECT e.raw FROM events e WHERE {} \
-         ORDER BY e.created_at DESC, e.id ASC LIMIT ?",
+         ORDER BY e.created_at DESC, e.id ASC LIMIT ? OFFSET ?",
         where_parts.join(" AND ")
     );
     params.push(SqlValue::from(i64::try_from(limit)?));
+    params.push(SqlValue::from(i64::try_from(offset)?));
     collect_events(conn, &sql, params)
 }
