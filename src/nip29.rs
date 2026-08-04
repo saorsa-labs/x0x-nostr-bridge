@@ -65,9 +65,14 @@
 //! the store the single source of truth across restarts and across both ingest
 //! doors.
 
-use nostr::{Event, Filter, Kind, Tag};
+use std::sync::{Arc, LazyLock};
+
+use dashmap::DashMap;
+use nostr::{Event, Filter, Kind, PublicKey, Tag};
+use tokio::sync::Mutex;
 
 use crate::engine_api::Visibility;
+use crate::http::fan_out_group_state;
 use crate::kinds;
 use crate::relay::AppState;
 use crate::relay_identity::now_secs;
@@ -344,6 +349,159 @@ async fn seed_member(state: &AppState, channel_id: &str, pubkey_hex: &str) {
     if let Err(e) = state.engine.seed_member(channel_id, pubkey_hex).await {
         tracing::debug!(error = %e, %channel_id, "seed_member mirror failed");
     }
+}
+
+/// Outcome of an authority-only membership admission from an accepted invite
+/// claim ([`add_member_from_invite`]). The caller never sees a "maybe added":
+/// [`Self::Added`] is returned only after the event is durable and fanned out,
+/// and an already-present claimant yields [`Self::Existing`] without a
+/// replacement.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum AddMemberOutcome {
+    /// The claimant was already present in the channel's authoritative 39002.
+    /// No replacement was emitted and no fan-out ran. `event_id` is the current
+    /// members event, so the caller can report membership without re-querying.
+    Existing { event_id: String },
+    /// The claimant was admitted: a fresh relay-signed 39002 was stored and
+    /// fanned out (gossip + live WS). Carries the authoritative event.
+    Added(Event),
+}
+
+/// Per-channel serialization of authority-only membership admissions
+/// ([`add_member_from_invite`]); held only across the read→emit critical
+/// section, never across fan-out.
+///
+/// Why a second lock at all: [`execute`] is single-threaded per request and the
+/// engine's replaceable semantics absorb its own races, but an invite claim is
+/// a fire-and-forget authority mutation that the transport retries and can
+/// deliver concurrently. Two claims for the same channel that both read the
+/// same prior 39002 compute the *same* `created_at` floor — [`emit`] forces it
+/// to `prev + 1` — and each signs a replacement, producing a double emit at an
+/// identical timestamp where NIP-01's tie-break silently drops one and the
+/// second claim's membership vanishes. Serializing read→emit makes the second
+/// claim observe the first's replacement as `prev`, so `created_at` strictly
+/// supersedes and exactly one event is stored and fanned out.
+#[allow(dead_code)]
+static INVITE_CHANNEL_LOCKS: LazyLock<DashMap<String, Arc<Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
+
+/// Clone the per-channel guard off the DashMap shard, so the shard read-lock is
+/// released before the `.await` on the tokio mutex — holding a DashMap shard
+/// across an await is a deadlock footgun.
+#[allow(dead_code)]
+fn invite_channel_guard(channel_id: &str) -> Arc<Mutex<()>> {
+    let entry = INVITE_CHANNEL_LOCKS
+        .entry(channel_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())));
+    // `Ref` derefs to the `Arc`; clone it out so the shard guard drops here.
+    Arc::clone(&*entry)
+}
+
+/// Admit one member from an accepted invite claim — the narrow authority-only
+/// seam the M1b invite transport (`invites.rs`) calls instead of synthesizing a
+/// client kind-9000.
+///
+/// # Authority
+///
+/// The claimant cannot supply an event or a signer; this is the *relay itself*
+/// exercising its NIP-29 authority. The only signing key touched is
+/// `state.identity` via `RelayIdentity::group_state_event`, exactly as
+/// [`execute`]'s add-user arm does, so the resulting 39002 is indistinguishable
+/// from one a channel admin's 9000 would have produced — and the public/WS
+/// doors still reject any client-authored 39002 (`kinds::is_relay_authored`).
+/// Channel-admin authorization was enforced at invite-mint time by the caller;
+/// it is not re-derived here, because there is no client author to
+/// authenticate and re-deriving a 9000 would defeat the seam.
+///
+/// # Semantics
+///
+/// - `channel_id` must name a channel that has a kind-39000 (same existence
+///   gate as the add-user arm of [`execute`]).
+/// - `claimant_compat_pubkey` must be a valid 32-byte hex Nostr key; it is
+///   canonicalized to lowercase hex and used verbatim as the 39002 `p` tag
+///   value — never as an author.
+/// - The claimant is recorded at the `member` role only: this path grants no
+///   admin/owner, and a claimant already present at *any* role is returned as
+///   [`AddMemberOutcome::Existing`] without a replacement (idempotent admission
+///   for transport retries and concurrent replays).
+/// - On admission the event is stored, then fanned out (gossip + live WS), then
+///   the engine membership cache is mirrored best-effort *after* the durable
+///   store — so a mirror failure cannot rescind an admission that already
+///   happened (see [`seed_member`], non-fatal like in [`execute`]).
+///
+/// `Err(reason)` reuses [`execute`]'s `"<class>: <detail>"` convention.
+/// The authority worker (`m1b::spawn_authority_worker` → `apply_claim`) is the
+/// sole caller, invoked exactly once per validated invite claim.
+pub(crate) async fn add_member_from_invite(
+    state: &Arc<AppState>,
+    channel_id: &str,
+    claimant_compat_pubkey: &str,
+) -> Result<AddMemberOutcome, String> {
+    if channel_id.is_empty() {
+        return Err("invalid: channel_id is empty".to_string());
+    }
+
+    // Strict pubkey validation: exactly 32 bytes of hex (64 chars). Rejects
+    // bech32/npub, wrong lengths, and non-hex before they can become a
+    // malformed `p` tag the client would render as a phantom member. `to_hex`
+    // canonicalizes to lowercase, so a claim made with uppercase hex still
+    // dedupes against an existing member entry below.
+    let pubkey_hex = PublicKey::from_hex(claimant_compat_pubkey)
+        .map_err(|e| format!("invalid: claimant pubkey is not 32-byte hex: {e}"))?
+        .to_hex();
+
+    // The channel must exist. There is no client author whose admin status to
+    // check here — the invite service bound token validity + admin-at-mint to
+    // this call, and the relay is the signer — so this mirrors only the
+    // add-user arm's existence gate, not its `is_authorized` check.
+    let meta_ev = latest_addressable(state, kinds::KIND_CHANNEL_METADATA, channel_id).await?;
+    if meta_ev.is_none() {
+        return Err("invalid: unknown group".to_string());
+    }
+
+    // Serialize read→emit per channel. The guard is cloned off the DashMap
+    // shard above, so the shard is free before we await the mutex.
+    let guard = invite_channel_guard(channel_id);
+    let serialize = guard.lock().await;
+
+    let members_ev = latest_addressable(state, kinds::KIND_GROUP_MEMBERS, channel_id).await?;
+    let mut members = MemberSet::from_event(members_ev.as_ref());
+
+    // Idempotent admission: a replayed or concurrent claim for a claimant
+    // already in the authoritative 39002 returns the current event id and emits
+    // nothing — no double replacement, no second fan-out. `members_ev` is `Some`
+    // whenever the set is non-empty (`from_event(None)` is empty), so the event
+    // id is always available on this branch.
+    if let Some(ev) = members_ev.as_ref() {
+        if members.entries.iter().any(|(pk, _)| pk == &pubkey_hex) {
+            return Ok(AddMemberOutcome::Existing {
+                event_id: ev.id.to_hex(),
+            });
+        }
+    }
+
+    // Admit at the member role only — never admin/owner through this path.
+    members.upsert(&pubkey_hex, "member");
+    // `emit_members` → `emit` forces `created_at = max(now, prev + 1)` and signs
+    // with `state.identity`, then stores durably via `engine.seed_event`.
+    let out = emit_members(state, channel_id, &members, members_ev.as_ref()).await?;
+
+    // The replacement is durable in the engine now. Drop the per-channel guard
+    // before fan-out so an unrelated claim on this channel is not blocked on
+    // gossip/WS dispatch.
+    drop(serialize);
+
+    // Fan out exactly once: gossip publish + live WS dispatch, the same helper
+    // the command door uses (`http::fan_out_group_state`).
+    fan_out_group_state(state, std::slice::from_ref(&out)).await;
+
+    // Mirror into the enforcement cache best-effort, strictly after the durable
+    // store — a failure here is logged and swallowed by `seed_member`, never an
+    // admission loss.
+    seed_member(state, channel_id, &pubkey_hex).await;
+
+    Ok(AddMemberOutcome::Added(out))
 }
 
 /// The current state of one channel, as carried by its kind-39000 tags.

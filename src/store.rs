@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use nostr::JsonUtil;
 use nostr::{Event, Filter};
 
+use crate::engine_api::Emit;
 use crate::proto;
 
 /// Owned SQL value used to build heterogeneous parameter lists.
@@ -44,6 +45,15 @@ pub enum InsertOutcome {
 #[async_trait]
 pub trait EventStore: Send + Sync {
     async fn insert(&self, ev: &Event) -> Result<InsertOutcome>;
+    /// Ingest, surfacing the thread-emit side effects the backing store computes
+    /// (roots whose relay-signed 39005 summary should be re-emitted post-commit).
+    /// The WS `EVENT` door uses this to drive the live 39005 fan-out. Default:
+    /// no emits — the spike `SqliteStore` has no thread engine, so its emits are
+    /// always empty and this falls back to a plain [`EventStore::insert`].
+    async fn insert_with_emits(&self, ev: &Event) -> Result<(InsertOutcome, Vec<Emit>)> {
+        let outcome = self.insert(ev).await?;
+        Ok((outcome, Vec::new()))
+    }
     async fn query(&self, filter: &Filter) -> Result<Vec<Event>>;
     async fn known_channels(&self) -> Result<Vec<String>>;
 }

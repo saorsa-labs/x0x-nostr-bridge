@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::engine_api::IngestOutcome;
 use crate::proto;
-use crate::relay::{publish_to_topics, AppState};
+use crate::relay::AppState;
 use crate::relay_identity::now_secs;
 use crate::transport::GossipMessage;
 
@@ -69,7 +69,10 @@ pub async fn ingest_one(state: &AppState, msg: &GossipMessage) {
                     state.engine.thread_summary(&channel, &emit.root_id).await
                 {
                     if let Ok(overlay) = state.identity.thread_summary_event(&summary, now_secs()) {
-                        publish_to_topics(&state.transport, &overlay).await;
+                        // Hub-only (mirrors fan_out_emits): the 39005 is a
+                        // relay-derived overlay — never republished to the
+                        // gossip fabric, or a mesh-delivered reply would echo
+                        // its summary back through the loop.
                         state.hub.dispatch(&overlay);
                     }
                 }

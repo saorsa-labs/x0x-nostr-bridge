@@ -3,6 +3,8 @@
 
 use std::net::SocketAddr;
 
+use sha2::{Digest, Sha256};
+
 use crate::transport;
 
 /// Resolve the daemon REST base URL + bearer token.
@@ -41,4 +43,21 @@ pub fn resolve_api_from(
 /// Whether `addr` is bound to a loopback interface.
 pub fn is_loopback(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// Lowercase-hex SHA-256 of the x0x daemon REST API base URL, normalized via
+/// [`crate::transport::normalize_base_url`] first. Published in the NIP-11
+/// `/info` doc as `x0x_api_fingerprint` so a caller can prove the bridge bound
+/// the expected daemon WITHOUT the bridge exposing the daemon's address. The
+/// bearer token is never part of the input. Normalizing here (idempotent over
+/// an already-normalized base, and identical to `resolve_api`/LocalStackRuntime's
+/// `daemon_fingerprint`) means raw and canonical forms of one base —
+/// `"127.0.0.1:12700"`, `"http://127.0.0.1:12700/"`, `"http://127.0.0.1:12700"`
+/// — fingerprint identically. Empty/whitespace input → empty fingerprint.
+pub fn api_fingerprint(api_base: &str) -> String {
+    if api_base.trim().is_empty() {
+        return String::new();
+    }
+    let normalized = crate::transport::normalize_base_url(api_base);
+    hex::encode(Sha256::digest(normalized.as_bytes()).as_slice())
 }
