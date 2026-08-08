@@ -78,7 +78,13 @@ pub async fn ingest_one(state: &AppState, msg: &GossipMessage) {
                 }
             }
         }
-        // Duplicate / Parked / Quarantined / rejected: invisible, no dispatch.
+        // Duplicate: the event id is already stored (idempotent redelivery).
+        // Logged so redelivery experiments can prove the copy REACHED this
+        // bridge and was deduped here — not dropped upstream in the fabric.
+        Ok(IngestOutcome::Duplicate { event_id }) => {
+            tracing::debug!(%event_id, "mesh ingest duplicate: already stored, no dispatch");
+        }
+        // Parked / Quarantined / rejected: invisible, no dispatch.
         Ok(_) => {}
         Err(e) => warn!(error = %e, "mesh ingest failed"),
     }
